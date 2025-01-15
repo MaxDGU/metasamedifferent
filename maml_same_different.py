@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
 import math
+import random
 
 class SameDifferentDataset(Dataset):
     def __init__(self, data_dir, tasks, mode='train'):
@@ -61,36 +62,19 @@ def debug_gradients(model, name=""):
 
 class SameDifferentCNN(nn.Module):
     def __init__(self):
-        #TODO: ensure same architecture as Kim et al 2018
-        # 6 convolutional layers with increasing channels:
-        # 3 → 18 → 36 → 72 → 144 → 288 → 576
-        # MaxPool2d reduces spatial dimensions by 2x after each conv
-        # Input: 128x128 → 64x64 → 32x32 → 16x16 → 8x8 → 4x4 → 2x2
-        
-        # 4 fully connected layers:
-        # flattened → 1024 → 1024 → 1024 → 1
+        # 2 conv layers:
+        # 3 → 6 → 12
+        # MaxPool3d(3,2) reduces spatial dimensions after each conv
         super(SameDifferentCNN, self).__init__()
         
         # Convolutional layers with batch norm
-        self.conv1 = nn.Conv2d(3, 18, kernel_size=6, stride=1, padding=3)
-        self.bn1 = nn.BatchNorm2d(18, track_running_stats=False)  # No running stats for meta-learning
+        self.conv1 = nn.Conv2d(3, 6, kernel_size=2, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(6, track_running_stats=False)
         
-        self.conv2 = nn.Conv2d(18, 36, kernel_size=2, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(36, track_running_stats=False)
+        self.conv2 = nn.Conv2d(6, 12, kernel_size=2, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(12, track_running_stats=False)
         
-        self.conv3 = nn.Conv2d(36, 72, kernel_size=2, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(72, track_running_stats=False)
-        
-        self.conv4 = nn.Conv2d(72, 144, kernel_size=2, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(144, track_running_stats=False)
-        
-        self.conv5 = nn.Conv2d(144, 288, kernel_size=2, stride=1, padding=1)
-        self.bn5 = nn.BatchNorm2d(288, track_running_stats=False)
-        
-        self.conv6 = nn.Conv2d(288, 576, kernel_size=2, stride=1, padding=1)
-        self.bn6 = nn.BatchNorm2d(576, track_running_stats=False)
-        
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2)
         
         # Calculate the size of flattened features
         self._to_linear = None
@@ -100,48 +84,32 @@ class SameDifferentCNN(nn.Module):
         self.fc1 = nn.Linear(self._to_linear, 1024)
         self.fc2 = nn.Linear(1024, 1024)
         self.fc3 = nn.Linear(1024, 1024)
-        self.fc4 = nn.Linear(1024, 1)
+        self.fc4 = nn.Linear(1024, 2)  # Changed to 2D output
         
-        # Initialize weights
+        # Initialize weights using Xavier initialization
         self._initialize_weights()
-        
-        # Wrap parameters to ensure they require gradients
-        for param in self.parameters():
-            if param.requires_grad:
-                param.data = param.data.clone().detach().requires_grad_(True)
     
     def _initialize_size(self):
         x = torch.randn(1, 3, 128, 128)
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 64x64
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 32x32
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))  # 16x16
-        x = self.pool(F.relu(self.bn4(self.conv4(x))))  # 8x8
-        x = self.pool(F.relu(self.bn5(self.conv5(x))))  # 4x4
-        x = self.pool(F.relu(self.bn6(self.conv6(x))))  # 2x2
-        x = x.reshape(x.size(0), -1)  # Flatten
-        self._to_linear = x.size(1)  # Get the flattened dimension size
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = x.reshape(x.size(0), -1)
+        self._to_linear = x.size(1)
     
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Larger initial weights for better gradients
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.Linear):
-                # Initialize final layer carefully
-                if m == self.fc4:  # Output layer
-                    nn.init.uniform_(m.weight, -0.1, 0.1)
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
                     nn.init.zeros_(m.bias)
-                else:
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    nn.init.constant_(m.bias, 0.1)  # Small positive bias
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x):
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))
-        x = self.pool(F.relu(self.bn4(self.conv4(x))))
-        x = self.pool(F.relu(self.bn5(self.conv5(x))))
-        x = self.pool(F.relu(self.bn6(self.conv6(x))))
         
         x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
@@ -152,8 +120,11 @@ class SameDifferentCNN(nn.Module):
 
 def accuracy(predictions, targets):
     with torch.no_grad():
-        predictions = torch.sigmoid(predictions)
-        predictions = (predictions > 0.5).float()
+        # Convert 2D logits to binary prediction
+        predictions = F.softmax(predictions, dim=1)
+        predictions = (predictions[:, 1] > 0.5).float()
+        # Convert binary targets to match prediction format
+        targets = targets.squeeze(1)
         return (predictions == targets).float().mean()
 
 def load_model(model_path, model, optimizer=None):
@@ -168,7 +139,7 @@ def test_gradient_flow():
     model = SameDifferentCNN().to(device)
     
     # Get a sample input
-    dataset = SameDifferentDataset('data/meta_h5', ['regular'], mode='train')
+    dataset = SameDifferentDataset('../data/meta_h5', ['regular'], mode='train')
     episode = dataset[0]
     
     # Move data to device
@@ -180,7 +151,7 @@ def test_gradient_flow():
     
     # Forward pass
     outputs = model(images)
-    loss = F.binary_cross_entropy_with_logits(outputs, labels)
+    loss = F.cross_entropy(outputs, labels.squeeze(1).long())
     
     # Backward pass
     loss.backward()
@@ -190,14 +161,14 @@ def test_gradient_flow():
     print("\nChecking gradients:")
     
     # Check conv layers
-    for i in range(1, 7):
+    for i in range(1, 3):
         conv = getattr(model, f'conv{i}')
         if conv.weight.grad is not None and conv.weight.grad.abs().sum() > 0:
             print(f"Conv{i} has gradients")
             has_gradients = True
     
     # Check fc layers
-    for i in range(1, 5):
+    for i in range(1, 4):
         fc = getattr(model, f'fc{i}')
         if fc.weight.grad is not None and fc.weight.grad.abs().sum() > 0:
             print(f"FC{i} has gradients")
@@ -208,28 +179,89 @@ def test_gradient_flow():
     
     return has_gradients
 
-def create_datasets(data_dir, all_tasks, val_split=0.2):
+def create_datasets(data_dir, all_tasks, val_split=0.2, test_split=0.1):
     """
-    Create train, validation, and test datasets with both task and episode splits.
+    Create train, validation, and test datasets by splitting episodes across all tasks.
+    Each task contributes to train/val/test sets.
     """
-    # Split tasks
-    num_tasks = len(all_tasks)
-    num_val_tasks = max(1, int(num_tasks * 0.2))  # 20% of tasks for validation
-    train_tasks = all_tasks[:-num_val_tasks-1]  # Leave one task for testing
-    val_tasks = all_tasks[-num_val_tasks-1:-1]
-    test_tasks = [all_tasks[-1]]  # Last task for testing
+    # First load all episodes from all tasks
+    all_episodes = []
+    for task in all_tasks:
+        # Load training episodes
+        train_file = os.path.join(data_dir, f'{task}_train.h5')
+        with h5py.File(train_file, 'r') as f:
+            num_episodes = f['support_images'].shape[0]
+            for i in range(num_episodes):
+                support_images = torch.FloatTensor(f['support_images'][i]).permute(0, 3, 1, 2)
+                query_images = torch.FloatTensor(f['query_images'][i]).permute(0, 3, 1, 2)
+                episode = {
+                    'support_images': support_images,
+                    'support_labels': torch.FloatTensor(f['support_labels'][i]),
+                    'query_images': query_images,
+                    'query_labels': torch.FloatTensor(f['query_labels'][i]),
+                    'task': task
+                }
+                all_episodes.append(episode)
+        
+        # Load test episodes (for validation/testing)
+        test_file = os.path.join(data_dir, f'{task}_test.h5')
+        with h5py.File(test_file, 'r') as f:
+            num_episodes = f['support_images'].shape[0]
+            for i in range(num_episodes):
+                support_images = torch.FloatTensor(f['support_images'][i]).permute(0, 3, 1, 2)
+                query_images = torch.FloatTensor(f['query_images'][i]).permute(0, 3, 1, 2)
+                episode = {
+                    'support_images': support_images,
+                    'support_labels': torch.FloatTensor(f['support_labels'][i]),
+                    'query_images': query_images,
+                    'query_labels': torch.FloatTensor(f['query_labels'][i]),
+                    'task': task
+                }
+                all_episodes.append(episode)
     
-    print(f"Train tasks: {train_tasks}")
-    print(f"Validation tasks: {val_tasks}")
-    print(f"Test tasks: {test_tasks}")
+    # Randomly shuffle all episodes
+    random.shuffle(all_episodes)
     
-    # Create datasets with episode splits for training tasks
-    train_dataset = SameDifferentDataset(data_dir, train_tasks, mode='train')
-    val_dataset_seen = SameDifferentDataset(data_dir, train_tasks, mode='test')  # Use test episodes for validation
-    val_dataset_unseen = SameDifferentDataset(data_dir, val_tasks, mode='test')
-    test_dataset = SameDifferentDataset(data_dir, test_tasks, mode='test')
+    # Calculate split indices
+    total_episodes = len(all_episodes)
+    val_size = int(total_episodes * val_split)
+    test_size = int(total_episodes * test_split)
+    train_size = total_episodes - val_size - test_size
     
-    return train_dataset, val_dataset_seen, val_dataset_unseen, test_dataset
+    print(f"\nDataset Split Info:")
+    print(f"Total episodes: {total_episodes}")
+    print(f"Training episodes: {train_size}")
+    print(f"Validation episodes: {val_size}")
+    print(f"Test episodes: {test_size}")
+    
+    # Create custom datasets
+    class EpisodeDataset(Dataset):
+        def __init__(self, episodes):
+            self.episodes = episodes
+        
+        def __len__(self):
+            return len(self.episodes)
+        
+        def __getitem__(self, idx):
+            episode = self.episodes[idx]
+            return {
+                'support_images': (episode['support_images'] / 127.5) - 1.0,
+                'support_labels': episode['support_labels'],
+                'query_images': (episode['query_images'] / 127.5) - 1.0,
+                'query_labels': episode['query_labels'],
+                'task': episode['task']
+            }
+    
+    # Split episodes into train/val/test
+    train_episodes = all_episodes[:train_size]
+    val_episodes = all_episodes[train_size:train_size + val_size]
+    test_episodes = all_episodes[train_size + val_size:]
+    
+    train_dataset = EpisodeDataset(train_episodes)
+    val_dataset = EpisodeDataset(val_episodes)
+    test_dataset = EpisodeDataset(test_episodes)
+    
+    return train_dataset, val_dataset, test_dataset
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
     def lr_lambda(current_step):
@@ -241,7 +273,8 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=5, max_episodes=50):
-    """Run validation on a dataset with limited episodes."""
+    # Tests with fixed number of adaptation steps
+    # Limits validation episodes for speed
     maml.module.eval()
     val_loss = 0.0
     val_acc = 0.0
@@ -279,13 +312,13 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
             # Adapt using support set
             for _ in range(num_adaptation_steps):
                 support_preds = learner(support_images)
-                support_loss = F.binary_cross_entropy_with_logits(support_preds, support_labels)
+                support_loss = F.cross_entropy(support_preds, support_labels.squeeze(1).long())
                 learner.adapt(support_loss)
             
             # Evaluate on query set
             with torch.no_grad():
                 query_preds = learner(query_images)
-                query_loss = F.binary_cross_entropy_with_logits(query_preds, query_labels)
+                query_loss = F.cross_entropy(query_preds, query_labels.squeeze(1).long())
                 query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss.item()
@@ -335,12 +368,12 @@ def train_epoch(maml, train_dataset, optimizer, scheduler, device, meta_batch_si
             # Inner loop adaptation
             for _ in range(num_adaptation_steps):
                 support_preds = learner(support_images)
-                support_loss = F.binary_cross_entropy_with_logits(support_preds, support_labels)
+                support_loss = F.cross_entropy(support_preds, support_labels.squeeze(1).long())
                 learner.adapt(support_loss)
             
             # Evaluate on query set
             query_preds = learner(query_images)
-            query_loss = F.binary_cross_entropy_with_logits(query_preds, query_labels)
+            query_loss = F.cross_entropy(query_preds, query_labels.squeeze(1).long())
             query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss
@@ -367,17 +400,18 @@ def main():
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     meta_batch_size = 8
-    num_epochs = 6
+    num_epochs = 10
     max_batches_per_epoch = 20
     train_adaptation_steps = 5  # Use 5 steps during training
     val_adaptation_steps = 10   # Use 10 steps during validation
     test_adaptation_steps = [10, 15, 20]  # Test with more steps
     
-    # Create datasets
+    # Create datasets with merged tasks
     all_tasks = ['regular', 'lines', 'open', 'wider_line', 'scrambled', 
-                 'random_color', 'arrows', 'irregular', 'filled', 'original']
-    train_dataset, val_dataset_seen, val_dataset_unseen, test_dataset = create_datasets(
-        'data/meta_h5', all_tasks)
+                 'random_color', 'arrows', 'irregular', 'filled'] # 'original'needs train file 
+    
+    train_dataset, val_dataset, test_dataset = create_datasets(
+        '../data/meta_h5', all_tasks, val_split=0.2, test_split=0.1)
     
     # Create model and MAML
     model = SameDifferentCNN()
@@ -390,31 +424,27 @@ def main():
     
     # Create scheduler
     num_training_steps = num_epochs * (len(train_dataset) // meta_batch_size)
-    num_warmup_steps = num_training_steps // 10  # 10% of training for warmup
+    num_warmup_steps = num_training_steps // 10
     scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps, num_training_steps)
     
     # Training loop with validation
     best_val_acc = 0.0
     for epoch in range(num_epochs):
-        # Training with 5 adaptation steps
+        # Training
         train_loss, train_acc = train_epoch(maml, train_dataset, opt, scheduler, 
-                                          device, meta_batch_size, max_batches_per_epoch,
-                                          num_adaptation_steps=train_adaptation_steps)
+                                          device, meta_batch_size, max_batches_per_epoch)
         
-        # Validation with 10 adaptation steps
-        val_loss_seen, val_acc_seen = validate(maml, val_dataset_seen, device,
-                                             num_adaptation_steps=val_adaptation_steps)
-        val_loss_unseen, val_acc_unseen = validate(maml, val_dataset_unseen, device,
-                                                  num_adaptation_steps=val_adaptation_steps)
+        # Validation
+        val_loss, val_acc = validate(maml, val_dataset, device,
+                                   num_adaptation_steps=val_adaptation_steps)
         
         print(f'\nEpoch {epoch+1}:')
         print(f'Train Loss = {train_loss:.4f}, Accuracy = {train_acc:.4f}')
-        print(f'Val (Seen) Loss = {val_loss_seen:.4f}, Accuracy = {val_acc_seen:.4f}')
-        print(f'Val (Unseen) Loss = {val_loss_unseen:.4f}, Accuracy = {val_acc_unseen:.4f}')
+        print(f'Val Loss = {val_loss:.4f}, Accuracy = {val_acc:.4f}')
         
         # Save best model
-        if val_acc_unseen > best_val_acc:
-            best_val_acc = val_acc_unseen
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
