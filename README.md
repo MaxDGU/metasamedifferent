@@ -17,5 +17,6 @@ python maml_same_different.py
 ## Configuration
 Key parameters in maml_same_different.py:
 - meta_batch_size: Number of tasks per batch
-- gradient_accumulation_steps: Steps before parameter update
-- learning_rates: 0.01 (inner), 0.001 (outer)
+- support/query sizes: we have 9 same/different training tasks, so these are 18 and 9 respectively 
+- adapatation_steps: iterations over the support set 
+- learning_rates: 0.01 (inner), 0.001 (outer) - need to do hyperparemeter tuning 
