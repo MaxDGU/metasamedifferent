@@ -9,15 +9,16 @@ import matplotlib.pyplot as plt
 class MetaDatasetGenerator:
     def __init__(self):
         self.tqdm = tqdm
+        self.support_sizes = [4, 6, 8, 10]  # Variable support sizes
+        self.query_size = 3  # Fixed query size
         
         def create_batch_generator(gen_fn):
             def batch_gen(label, batch_size=32):
                 images = []
                 for _ in range(batch_size):
-                    # Get a single image
                     single_batch = next(gen_fn(batch_size=1, 
                                              category_type='same' if label else 'different'))
-                    images.append(single_batch[0][0])  # Get the first (and only) image
+                    images.append(single_batch[0][0])
                 return np.array(images)
             return batch_gen
 
@@ -39,39 +40,34 @@ class MetaDatasetGenerator:
         self._load_original_data()
     
     def _load_original_data(self):
-        """Load and cache original SVRT dataset"""
+        """Load and cache original SVRT dataset from train/val/test splits"""
         self.feature_description = {
             'image_raw': tf.io.FixedLenFeature([], tf.string),
             'label': tf.io.FixedLenFeature([], tf.int64)
         }
         
-        # Load original SVRT data
-        self.original_train_data = {0: [], 1: []}  # Different: 0, Same: 1
-        self.original_test_data = {0: [], 1: []}
+        # Load original SVRT data for each split
+        self.original_data = {
+            'train': {0: [], 1: []},  # Different: 0, Same: 1
+            'val': {0: [], 1: []},
+            'test': {0: [], 1: []}
+        }
         
-        # Load training data
-        train_dataset = tf.data.TFRecordDataset('data/original_train.tfrecords')
-        for raw_record in train_dataset:
-            example = tf.io.parse_single_example(raw_record, self.feature_description)
-            image = tf.io.decode_png(example['image_raw'], channels=3)
-            label = example['label']
-            self.original_train_data[label.numpy()].append(image)
-            
-        # Load test data
-        test_dataset = tf.data.TFRecordDataset('data/original_test.tfrecords')
-        for raw_record in test_dataset:
-            example = tf.io.parse_single_example(raw_record, self.feature_description)
-            image = tf.io.decode_png(example['image_raw'], channels=3)
-            label = example['label']
-            self.original_test_data[label.numpy()].append(image)
+        # Load data for each split
+        for split in ['train', 'val', 'test']:
+            dataset = tf.data.TFRecordDataset(f'../data/original_{split}.tfrecords')
+            for raw_record in dataset:
+                example = tf.io.parse_single_example(raw_record, self.feature_description)
+                image = tf.io.decode_png(example['image_raw'], channels=3)
+                label = example['label']
+                self.original_data[split][label.numpy()].append(image)
     
-    def _load_original_svrt(self, label, is_training=True):
-        """Get a random image from original SVRT dataset with specified label"""
-        data_source = self.original_train_data if is_training else self.original_test_data
-        images = data_source[label]
+    def _load_original_svrt(self, label, split='train'):
+        """Get a random image from original SVRT dataset with specified label and split"""
+        images = self.original_data[split][label]
         return images[np.random.randint(len(images))]
     
-    def _create_episode(self, generator_fn, num_support=16, num_query=8, is_training=True):
+    def _create_episode(self, generator_fn, num_support=4, num_query=3, split='train'):
         """Creates a single episode with support and query sets"""
         # Generate balanced pairs for support set
         support_pairs = []
@@ -81,16 +77,16 @@ class MetaDatasetGenerator:
                 image_batch = generator_fn(1, batch_size=1)  
                 image = np.clip(image_batch[0] * 255.0, 0, 255).astype(np.uint8)
             else:
-                image = generator_fn(1, is_training)  # 1 for "same"
+                image = generator_fn(1, split)
             support_pairs.append((image, 1.0))
         
         # Generate different pairs (num_support // 2)
         for _ in range(num_support // 2):
             if generator_fn != self._load_original_svrt:
-                image_batch = generator_fn(0, batch_size=1)  # 0 for "different"
+                image_batch = generator_fn(0, batch_size=1)
                 image = np.clip(image_batch[0] * 255.0, 0, 255).astype(np.uint8)
             else:
-                image = generator_fn(0, is_training) 
+                image = generator_fn(0, split)
             support_pairs.append((image, 0.0))
             
         # Generate balanced pairs for query set
@@ -101,7 +97,7 @@ class MetaDatasetGenerator:
                 image_batch = generator_fn(1, batch_size=1)
                 image = np.clip(image_batch[0] * 255.0, 0, 255).astype(np.uint8)
             else:
-                image = generator_fn(1, is_training)
+                image = generator_fn(1, split)
             query_pairs.append((image, 1.0))
             
         # Generate different pairs (num_query // 2)
@@ -110,7 +106,7 @@ class MetaDatasetGenerator:
                 image_batch = generator_fn(0, batch_size=1)
                 image = np.clip(image_batch[0] * 255.0, 0, 255).astype(np.uint8)
             else:
-                image = generator_fn(0, is_training)
+                image = generator_fn(0, split)
             query_pairs.append((image, 0.0))
             
         # Shuffle the pairs while maintaining correspondence
@@ -134,48 +130,47 @@ class MetaDatasetGenerator:
             'query_labels': query_labels
         }
     
-    def generate_dataset(self, output_dir, episodes_per_dataset=1000):
-        """Generates meta-learning episodes and saves them in HDF5 format"""
+    def generate_dataset(self, output_dir, episodes_per_split={'train': 1000, 'val': 200, 'test': 200}):
+        """Generates meta-learning episodes with variable support sizes"""
         os.makedirs(output_dir, exist_ok=True)
         
         for dataset_name, generator_fn in self.generators.items():
             print(f"\nGenerating episodes for {dataset_name}...")
             
-            # Create HDF5 file for this dataset type
-            train_path = os.path.join(output_dir, f'{dataset_name}_train.h5')
-            test_path = os.path.join(output_dir, f'{dataset_name}_test.h5')
-            
-            # Generate training episodes
-            train_episodes = []
-            for _ in self.tqdm(range(episodes_per_dataset), desc="Training"):
-                episode = self._create_episode(generator_fn, is_training=True)
-                train_episodes.append(episode)
-            
-            # Save training episodes
-            with h5py.File(train_path, 'w') as f:
-                f.create_dataset('support_images', data=np.stack([ep['support_images'] for ep in train_episodes]))
-                f.create_dataset('support_labels', data=np.stack([ep['support_labels'] for ep in train_episodes]))
-                f.create_dataset('query_images', data=np.stack([ep['query_images'] for ep in train_episodes]))
-                f.create_dataset('query_labels', data=np.stack([ep['query_labels'] for ep in train_episodes]))
-            
-            # Generate test episodes
-            test_episodes = []
-            for _ in self.tqdm(range(episodes_per_dataset // 5), desc="Testing"):
-                episode = self._create_episode(generator_fn, is_training=False)
-                test_episodes.append(episode)
-            
-            # Save test episodes
-            with h5py.File(test_path, 'w') as f:
-                f.create_dataset('support_images', data=np.stack([ep['support_images'] for ep in test_episodes]))
-                f.create_dataset('support_labels', data=np.stack([ep['support_labels'] for ep in test_episodes]))
-                f.create_dataset('query_images', data=np.stack([ep['query_images'] for ep in test_episodes]))
-                f.create_dataset('query_labels', data=np.stack([ep['query_labels'] for ep in test_episodes]))
-            
-            print(f"Completed {dataset_name}")
-            
-            # Verify the saved data
-            self._verify_dataset(train_path, dataset_name, "training")
-            self._verify_dataset(test_path, dataset_name, "testing")
+            for support_size in self.support_sizes:
+                print(f"\nGenerating episodes with support size {support_size}...")
+                
+                for split in ['train', 'val', 'test']:
+                    output_file = os.path.join(output_dir, 
+                                             f'{dataset_name}_support{support_size}_{split}.h5')
+                    
+                    # Generate episodes
+                    episodes = []
+                    for _ in self.tqdm(range(episodes_per_split[split]), 
+                                     desc=f"{split.capitalize()} episodes"):
+                        episode = self._create_episode(
+                            generator_fn, 
+                            num_support=support_size,
+                            num_query=self.query_size,
+                            split=split
+                        )
+                        episodes.append(episode)
+                    
+                    # Save episodes
+                    with h5py.File(output_file, 'w') as f:
+                        f.create_dataset('support_images', 
+                                       data=np.stack([ep['support_images'] for ep in episodes]))
+                        f.create_dataset('support_labels', 
+                                       data=np.stack([ep['support_labels'] for ep in episodes]))
+                        f.create_dataset('query_images', 
+                                       data=np.stack([ep['query_images'] for ep in episodes]))
+                        f.create_dataset('query_labels', 
+                                       data=np.stack([ep['query_labels'] for ep in episodes]))
+                    
+                    # Verify the saved data
+                    self._verify_dataset(output_file, 
+                                       f"{dataset_name}_support{support_size}", 
+                                       split)
     
     def _verify_dataset(self, file_path, dataset_name, split_type, num_episodes_to_check=5):
         """Verify that the generated episodes are saved and loaded correctly"""
@@ -225,7 +220,7 @@ class MetaDatasetGenerator:
                     plt.savefig(os.path.join(os.path.dirname(file_path), f'{dataset_name}_{split_type}_sample.png'))
                     plt.close()
 
-def verify_h5_dataset(data_dir='data/meta_h5', num_episodes_to_check=5):
+def verify_h5_dataset(data_dir='../data/meta_h5', num_episodes_to_check=5):
     """Standalone verification function for HDF5 datasets"""
     print("Verifying HDF5 datasets...")
     
@@ -266,17 +261,22 @@ def verify_h5_dataset(data_dir='data/meta_h5', num_episodes_to_check=5):
                 print(f"Error loading {split} dataset for {dataset_type}: {str(e)}")
 
 if __name__ == '__main__':
-    # Create output directory
+    # Create output directory for variable support size data
     output_dir = 'data/meta_h5'
     os.makedirs(output_dir, exist_ok=True)
     
-    print("Starting HDF5 dataset generation...")
-    print("Generating episodes with 16 support and 8 query examples...")
+    print("Starting variable support size dataset generation...")
+    
+    episodes_per_split = {
+        'train': 1000,
+        'val': 200,
+        'test': 200
+    }
     
     # Create generator and generate datasets
     generator = MetaDatasetGenerator()
-    generator.generate_dataset(output_dir, episodes_per_dataset=1000)
+    generator.generate_dataset(output_dir, episodes_per_split=episodes_per_split)
     
     # Verify the generated episodes
     print("\nVerifying generated episodes...")
-    verify_h5_dataset() 
+    verify_h5_dataset(data_dir='data/meta_h5')

@@ -12,42 +12,67 @@ import math
 import random
 
 class SameDifferentDataset(Dataset):
-    def __init__(self, data_dir, tasks, mode='train'):
+    def __init__(self, data_dir, tasks, split, support_sizes=[4, 6, 8, 10]):
         self.data_dir = data_dir
         self.tasks = tasks
-        self.mode = mode
-        self.episodes = []
+        self.split = split
+        self.support_sizes = support_sizes
         
-        # Load episodes from each task
+        # Create a list of all possible episode files
+        self.episode_files = []
         for task in tasks:
-            file_path = os.path.join(data_dir, f'{task}_{mode}.h5')
-            with h5py.File(file_path, 'r') as f:
+            for support_size in support_sizes:
+                file_path = os.path.join(data_dir, f'{task}_support{support_size}_{split}.h5')
+                if os.path.exists(file_path):
+                    self.episode_files.append({
+                        'file_path': file_path,
+                        'task': task,
+                        'support_size': support_size
+                    })
+        
+        # Calculate total number of episodes
+        self.total_episodes = 0
+        self.file_episode_counts = []
+        for file_info in self.episode_files:
+            with h5py.File(file_info['file_path'], 'r') as f:
                 num_episodes = f['support_images'].shape[0]
-                for i in range(num_episodes):
-                    # Convert from NHWC to NCHW format
-                    support_images = torch.FloatTensor(f['support_images'][i]).permute(0, 3, 1, 2)
-                    query_images = torch.FloatTensor(f['query_images'][i]).permute(0, 3, 1, 2)
-                    
-                    episode = {
-                        'support_images': support_images,
-                        'support_labels': torch.FloatTensor(f['support_labels'][i]),
-                        'query_images': query_images,
-                        'query_labels': torch.FloatTensor(f['query_labels'][i]),
-                        'task': task
-                    }
-                    self.episodes.append(episode)
+                self.file_episode_counts.append(num_episodes)
+                self.total_episodes += num_episodes
     
     def __len__(self):
-        return len(self.episodes)
+        return self.total_episodes
     
     def __getitem__(self, idx):
-        episode = self.episodes[idx]
+        # Find which file contains this index
+        file_idx = 0
+        running_count = 0
+        while running_count + self.file_episode_counts[file_idx] <= idx:
+            running_count += self.file_episode_counts[file_idx]
+            file_idx += 1
+        
+        # Calculate the episode index within the file
+        episode_idx = idx - running_count
+        
+        # Load the episode from the appropriate file
+        file_info = self.episode_files[file_idx]
+        with h5py.File(file_info['file_path'], 'r') as f:
+            episode = {
+                'support_images': torch.FloatTensor(f['support_images'][episode_idx]),
+                'support_labels': torch.FloatTensor(f['support_labels'][episode_idx]),
+                'query_images': torch.FloatTensor(f['query_images'][episode_idx]),
+                'query_labels': torch.FloatTensor(f['query_labels'][episode_idx]),
+                'task': file_info['task'],
+                'support_size': file_info['support_size']
+            }
+        
+        # Convert to NCHW format and normalize
         return {
-            'support_images': (episode['support_images'] / 127.5) - 1.0,
+            'support_images': ((episode['support_images'].permute(0, 3, 1, 2) / 127.5) - 1.0),
             'support_labels': episode['support_labels'],
-            'query_images': (episode['query_images'] / 127.5) - 1.0,
+            'query_images': ((episode['query_images'].permute(0, 3, 1, 2) / 127.5) - 1.0),
             'query_labels': episode['query_labels'],
-            'task': episode['task']
+            'task': episode['task'],
+            'support_size': episode['support_size']
         }
 
 def debug_gradients(model, name=""):
@@ -138,9 +163,9 @@ def test_gradient_flow():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = SameDifferentCNN().to(device)
     
-    # Get a sample input
-    dataset = SameDifferentDataset('../data/meta_h5', ['regular'], mode='train')
-    episode = dataset[0]
+    # Get a sample input using create_datasets
+    train_dataset, _, _ = create_datasets('data/meta_h5', ['regular'])
+    episode = train_dataset[0]
     
     # Move data to device
     images = episode['support_images'].to(device)
@@ -179,87 +204,16 @@ def test_gradient_flow():
     
     return has_gradients
 
-def create_datasets(data_dir, all_tasks, val_split=0.2, test_split=0.1):
-    """
-    Create train, validation, and test datasets by splitting episodes across all tasks.
-    Each task contributes to train/val/test sets.
-    """
-    # First load all episodes from all tasks
-    all_episodes = []
-    for task in all_tasks:
-        # Load training episodes
-        train_file = os.path.join(data_dir, f'{task}_train.h5')
-        with h5py.File(train_file, 'r') as f:
-            num_episodes = f['support_images'].shape[0]
-            for i in range(num_episodes):
-                support_images = torch.FloatTensor(f['support_images'][i]).permute(0, 3, 1, 2)
-                query_images = torch.FloatTensor(f['query_images'][i]).permute(0, 3, 1, 2)
-                episode = {
-                    'support_images': support_images,
-                    'support_labels': torch.FloatTensor(f['support_labels'][i]),
-                    'query_images': query_images,
-                    'query_labels': torch.FloatTensor(f['query_labels'][i]),
-                    'task': task
-                }
-                all_episodes.append(episode)
-        
-        # Load test episodes (for validation/testing)
-        test_file = os.path.join(data_dir, f'{task}_test.h5')
-        with h5py.File(test_file, 'r') as f:
-            num_episodes = f['support_images'].shape[0]
-            for i in range(num_episodes):
-                support_images = torch.FloatTensor(f['support_images'][i]).permute(0, 3, 1, 2)
-                query_images = torch.FloatTensor(f['query_images'][i]).permute(0, 3, 1, 2)
-                episode = {
-                    'support_images': support_images,
-                    'support_labels': torch.FloatTensor(f['support_labels'][i]),
-                    'query_images': query_images,
-                    'query_labels': torch.FloatTensor(f['query_labels'][i]),
-                    'task': task
-                }
-                all_episodes.append(episode)
-    
-    # Randomly shuffle all episodes
-    random.shuffle(all_episodes)
-    
-    # Calculate split indices
-    total_episodes = len(all_episodes)
-    val_size = int(total_episodes * val_split)
-    test_size = int(total_episodes * test_split)
-    train_size = total_episodes - val_size - test_size
+def create_datasets(data_dir, all_tasks, support_sizes=[4, 6, 8, 10]):
+    """Create train, validation, and test datasets."""
+    train_dataset = SameDifferentDataset(data_dir, all_tasks, 'train', support_sizes)
+    val_dataset = SameDifferentDataset(data_dir, all_tasks, 'val', support_sizes)
+    test_dataset = SameDifferentDataset(data_dir, all_tasks, 'test', support_sizes)
     
     print(f"\nDataset Split Info:")
-    print(f"Total episodes: {total_episodes}")
-    print(f"Training episodes: {train_size}")
-    print(f"Validation episodes: {val_size}")
-    print(f"Test episodes: {test_size}")
-    
-    # Create custom datasets
-    class EpisodeDataset(Dataset):
-        def __init__(self, episodes):
-            self.episodes = episodes
-        
-        def __len__(self):
-            return len(self.episodes)
-        
-        def __getitem__(self, idx):
-            episode = self.episodes[idx]
-            return {
-                'support_images': (episode['support_images'] / 127.5) - 1.0,
-                'support_labels': episode['support_labels'],
-                'query_images': (episode['query_images'] / 127.5) - 1.0,
-                'query_labels': episode['query_labels'],
-                'task': episode['task']
-            }
-    
-    # Split episodes into train/val/test
-    train_episodes = all_episodes[:train_size]
-    val_episodes = all_episodes[train_size:train_size + val_size]
-    test_episodes = all_episodes[train_size + val_size:]
-    
-    train_dataset = EpisodeDataset(train_episodes)
-    val_dataset = EpisodeDataset(val_episodes)
-    test_dataset = EpisodeDataset(test_episodes)
+    print(f"Training episodes: {len(train_dataset)}")
+    print(f"Validation episodes: {len(val_dataset)}")
+    print(f"Test episodes: {len(test_dataset)}")
     
     return train_dataset, val_dataset, test_dataset
 
@@ -400,18 +354,19 @@ def main():
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     meta_batch_size = 8
-    num_epochs = 10
+    num_epochs = 50
     max_batches_per_epoch = 20
-    train_adaptation_steps = 5  # Use 5 steps during training
-    val_adaptation_steps = 10   # Use 10 steps during validation
-    test_adaptation_steps = [10, 15, 20]  # Test with more steps
+    train_adaptation_steps = 5
+    val_adaptation_steps = 15
+    test_adaptation_steps = [15, 20, 25]
+    max_val_episodes = 200
     
     # Create datasets with merged tasks
     all_tasks = ['regular', 'lines', 'open', 'wider_line', 'scrambled', 
-                 'random_color', 'arrows', 'irregular', 'filled'] # 'original'needs train file 
+                 'random_color', 'arrows', 'irregular', 'filled', 'original']
     
     train_dataset, val_dataset, test_dataset = create_datasets(
-        '../data/meta_h5', all_tasks, val_split=0.2, test_split=0.1)
+        'data/meta_h5', all_tasks)
     
     # Create model and MAML
     model = SameDifferentCNN()
@@ -436,7 +391,8 @@ def main():
         
         # Validation
         val_loss, val_acc = validate(maml, val_dataset, device,
-                                   num_adaptation_steps=val_adaptation_steps)
+                                   num_adaptation_steps=val_adaptation_steps,
+                                   max_episodes=max_val_episodes)
         
         print(f'\nEpoch {epoch+1}:')
         print(f'Train Loss = {train_loss:.4f}, Accuracy = {train_acc:.4f}')
