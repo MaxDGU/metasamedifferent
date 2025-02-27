@@ -3,7 +3,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-# Define constants
+#TO BE RUN after all seeds have been trained
 PB_TASKS = [
     'regular', 'lines', 'open', 'wider_line', 'scrambled',
     'random_color', 'arrows', 'irregular', 'filled', 'original'
@@ -23,9 +23,8 @@ def compile_results(base_dir='results/pb_baselines'):
         }
     }
     
-    all_accuracies = []  # Store all accuracies for overall statistics
+    all_accuracies = []
     
-    # Initialize architecture results
     for arch in ARCHITECTURES:
         results['by_architecture'][arch] = {
             'mean': None,
@@ -34,7 +33,6 @@ def compile_results(base_dir='results/pb_baselines'):
             'by_task': {}
         }
         
-        # Initialize task results for this architecture
         for task in PB_TASKS:
             results['by_architecture'][arch]['by_task'][task] = {
                 'accuracies': [],

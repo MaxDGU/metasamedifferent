@@ -47,7 +47,7 @@ SEED=${{SEEDS[$seed_idx]}}
 echo "Running job for test_task=$TASK arch=$ARCH seed=$SEED"
 
 # Run the training script
-python -m baselines.train_pb_models \\
+python -m train_pb_models \\
     --test_task $TASK \\
     --architecture $ARCH \\
     --seed $SEED \\

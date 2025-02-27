@@ -10,7 +10,9 @@ from tqdm import tqdm
 import random
 import argparse
 from PIL import Image
-from .models import Conv2CNN, Conv4CNN, Conv6CNN
+from models.conv2 import SameDifferentCNN as Conv2CNN
+from models.conv4 import SameDifferentCNN as Conv4CNN
+from models.conv6 import SameDifferentCNN as Conv6CNN
 
 class PBDataset(Dataset):
     """Dataset for PB tasks with balanced task representation."""
