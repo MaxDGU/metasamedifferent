@@ -2,7 +2,7 @@ import sys
 import os
 import argparse
 import json
-from .models import main, pb_tasks
+from models import main, pb_tasks
 
 def train_holdout(held_out_task, data_dir, output_dir, num_seeds=20):
     """Train models with the specified held-out task for multiple seeds."""

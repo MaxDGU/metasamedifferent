@@ -12,7 +12,6 @@ import random
 from conv6lr import SameDifferentCNN, accuracy, EarlyStopping, SameDifferentDataset
 import sys
 
-# Define all tasks
 svrt_tasks = ['1', '7', '5', '15', '16', '19', '20', '21', '22']
 pb_tasks = ['regular', 'lines', 'open', 'wider_line', 'scrambled', 
             'random_color', 'arrows', 'irregular', 'filled', 'original']
@@ -20,11 +19,9 @@ pb_tasks = ['regular', 'lines', 'open', 'wider_line', 'scrambled',
 
 def create_datasets(data_dir, train_tasks, test_task, support_sizes=[4, 6, 8, 10]):
     """Create train, validation, and test datasets with specified tasks."""
-    # Training and validation datasets contain all training tasks
     train_dataset = SameDifferentDataset(data_dir, train_tasks, 'train', support_sizes)
     val_dataset = SameDifferentDataset(data_dir, train_tasks, 'val', support_sizes)
     
-    # Test dataset only contains the held-out task
     test_dataset = SameDifferentDataset(data_dir, [test_task], 'test', support_sizes)
     
     print(f"\nDataset Split Info:")
@@ -42,18 +39,15 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
     val_loss = 0.0
     val_acc = 0.0
     
-    # Handle both dataset and list of episodes
     if isinstance(val_dataset, list):
-        # If passed a list of episodes, use them directly
         episodes = val_dataset
         num_batches = 1
-        task_metrics = {}  # Initialize empty task metrics
+        task_metrics = {}
         for episode in episodes:
             task = episode['task']
             if task not in task_metrics:
                 task_metrics[task] = {'acc': [], 'loss': []}
     else:
-        # If passed a dataset, sample episodes as before
         num_batches = max_episodes // meta_batch_size
         episodes = val_dataset.get_balanced_batch(meta_batch_size)
         task_metrics = {task: {'acc': [], 'loss': []} for task in val_dataset.tasks}
@@ -110,7 +104,6 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
         task_accs = {task: np.mean(metrics['acc']) if metrics['acc'] else 0.0
                     for task, metrics in task_metrics.items()}
         
-        # Show progress with task-specific accuracies
         pbar.set_postfix({
             'loss': f'{batch_loss:.4f}',
             'acc': f'{batch_acc:.4f}',
@@ -133,7 +126,6 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
         random.seed(seed)
         torch.cuda.manual_seed(seed) if torch.cuda.is_available() else None
     
-    # Initialize metrics
     metrics = {
         'train_loss': [],
         'train_acc': [],
@@ -142,11 +134,9 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
         'test_metrics': {}
     }
     
-    # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Set up data directories
     if data_dir is None:
         pb_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'pb', 'pb')
         svrt_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'svrt_fixed')
@@ -155,10 +145,9 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
         svrt_data_dir = os.path.join(data_dir, 'svrt_fixed')
     
     # Create train/val/test datasets
-    # Include all SVRT tasks and all PB tasks except the held out one
+    # Include all PB tasks except the held out one
     train_pb_tasks = [task for task in pb_tasks if task != held_out_task]
     
-    # Create separate datasets for PB and SVRT data
     train_pb_dataset = SameDifferentDataset(
         pb_data_dir,
         train_pb_tasks,
@@ -297,7 +286,6 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
                 'acc': f'{running_acc/(batch_idx+1):.4f}'
             })
         
-        # Store training metrics
         epoch_loss = running_loss / num_batches
         epoch_acc = running_acc / num_batches
         metrics['train_loss'].append(epoch_loss)
@@ -351,7 +339,6 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
         'num_adaptation_steps': test_adaptation_steps
     }
     
-    # Save final model and metrics
     torch.save({
         'model_state_dict': model.state_dict(),
         'metrics': metrics,
