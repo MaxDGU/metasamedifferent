@@ -44,5 +44,4 @@ python -m meta_baseline.train_and_test_meta_baselines \
     --support_size 10 \
     --adaptation_steps 5 \
     --test_adaptation_steps 15 \
-    --inner_lr 0.05 \
     --outer_lr 0.001 

@@ -24,24 +24,19 @@ class SameDifferentCNN(nn.Module):
     def __init__(self):
         super(SameDifferentCNN, self).__init__()
         
+        # 2-layer CNN from Kim et al.
         self.conv1 = nn.Conv2d(3, 6, kernel_size=2, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(6, track_running_stats=False)
-        
-        # Subsequent layers: 2x2 filters with doubling filter counts
-        # Add padding=1 to maintain spatial dimensions better
         self.conv2 = nn.Conv2d(6, 12, kernel_size=2, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(12, track_running_stats=False)
         
-        
-        # Study's pooling: 3x3 with stride 2
-        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # Add padding=1 to pooling
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.dropout2d = nn.Dropout2d(0.1)
-        
-        # Calculate the size of flattened features
+
         self._to_linear = None
         self._initialize_size()
         
-        # Three FC layers with 1024 units each as per study
+        # Three FC layers with 1024 units each
         self.fc_layers = nn.ModuleList([
             nn.Linear(self._to_linear, 1024),
             nn.Linear(1024, 1024),
@@ -60,16 +55,13 @@ class SameDifferentCNN(nn.Module):
             nn.Dropout(0.3)
         ])
         
-        # Final classification layer
         self.classifier = nn.Linear(1024, 2)
         
-        # Initialize temperature parameter properly
         self.temperature = nn.Parameter(torch.ones(1) * 1.0)
         
-        # Initialize weights
         self._initialize_weights()
 
-        # Keep learned learning rates
+        # Learnable per-layer learning rates: initialized to 0.01
         self.lr_conv = nn.ParameterList([
             nn.Parameter(torch.ones(1) * 0.01) for _ in range(2)
         ])
@@ -86,42 +78,35 @@ class SameDifferentCNN(nn.Module):
         self._to_linear = x.size(1)
 
     def _initialize_weights(self):
-        # Initialize convolutional layers
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.01)  # Small positive bias
+                    nn.init.constant_(m.bias, 0.01) 
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                nn.init.constant_(m.bias, 0.01)  # Small positive bias
+                nn.init.constant_(m.bias, 0.01) 
         
         # Initialize classifier with smaller weights for less confident initial predictions
         nn.init.normal_(self.classifier.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.classifier.bias, 0)
     
     def forward(self, x):
-        # Convolutional layers with spatial dropout
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
         x = self.dropout2d(x)
         
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
         x = self.dropout2d(x)
     
-        
-        # Flatten
         x = x.reshape(x.size(0), -1)
         
-        # Fully connected layers (without residual connections)
         for fc, ln, dropout in zip(self.fc_layers, self.layer_norms, self.dropouts):
             x = dropout(F.relu(ln(fc(x))))
         
-        # Final classification with temperature scaling
         x = self.classifier(x)
-        # Ensure temperature is properly connected to graph
         return F.softmax(x / self.temperature.abs(), dim=1)
     
     def get_layer_lrs(self):

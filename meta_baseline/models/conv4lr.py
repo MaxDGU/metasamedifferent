@@ -20,19 +20,11 @@ import sys
 train_tasks =  ['regular', 'lines', 'open', 'wider_line', 'scrambled',
                  'random_color', 'arrows', 'irregular', 'filled', 'original']
 
-def debug_gradients(model, name=""):
-    """Print gradient statistics for model parameters"""
-    for n, p in model.named_parameters():
-        if p.grad is not None:
-            print(f"{name} {n}: grad mean={p.grad.mean():.4f}, std={p.grad.std():.4f}")
-        else:
-            print(f"{name} {n}: No gradient")
-
 class SameDifferentCNN(nn.Module):
     def __init__(self):
         super(SameDifferentCNN, self).__init__()
         
-        # 4-layer CNN with increasing filter counts
+        # 4-layer CNN from Kim et al.
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32, track_running_stats=False)
         
@@ -71,7 +63,7 @@ class SameDifferentCNN(nn.Module):
         self.classifier = nn.Linear(128, 2)
         self.temperature = nn.Parameter(torch.ones(1))
         
-        # Learnable per-layer learning rates
+        # Learnable per-layer learning rates: initialized to 0.01
         self.lr_conv = nn.ParameterList([
             nn.Parameter(torch.ones(1) * 0.01) for _ in range(4)
         ])
@@ -94,14 +86,12 @@ class SameDifferentCNN(nn.Module):
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                #kaiming initialization was easier for this task set-up than xavier
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 nn.init.constant_(m.bias, 0.01)
             elif isinstance(m, nn.Linear) and m != self.classifier:
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 nn.init.constant_(m.bias, 0.01)
         
-        # Initialize classifier with smaller weights for less confident predictions
         nn.init.normal_(self.classifier.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.classifier.bias, 0)
     
@@ -175,7 +165,7 @@ class EarlyStopping:
             self.best_val = val_acc
         elif val_acc < self.best_val + self.min_delta:
             self.counter += 1
-            if self.counter >= patience:
+            if self.counter >= self.patience:
                 self.should_stop = True
         else:
             self.best_val = val_acc   

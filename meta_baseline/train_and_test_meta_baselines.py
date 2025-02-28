@@ -42,7 +42,7 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 def train_epoch(model, train_loader, optimizer, device, adaptation_steps, scaler):
-    """Single training epoch with mixed precision and gradient monitoring."""
+    """Train for one epoch using mixed precision."""
     model.train()
     total_loss = 0
     total_acc = 0
@@ -63,40 +63,26 @@ def train_epoch(model, train_loader, optimizer, device, adaptation_steps, scaler
                 query_images = episode['query_images'].to(device, non_blocking=True)
                 query_labels = episode['query_labels'].unsqueeze(1).to(device, non_blocking=True)
                 
-                for step in range(adaptation_steps):
+                # Get per-layer learning rates
+                layer_lrs = learner.module.get_layer_lrs()
+                
+                # Inner loop adaptation
+                for _ in range(adaptation_steps):
                     support_preds = learner(support_images)
                     support_loss = F.binary_cross_entropy_with_logits(
                         support_preds[:, 1], support_labels.squeeze(1).float())
                     
-                    if support_loss.item() > 10 and step == 0:
-                        print(f"\nWARNING: High support loss: {support_loss.item():.4f}")
-                        print("Support predictions:", torch.sigmoid(support_preds[:, 1]).detach().cpu().numpy())
-                        print("Support labels:", support_labels.squeeze(1).cpu().numpy())
+                    # Calculate gradients
+                    grads = torch.autograd.grad(support_loss, learner.parameters(),
+                                              create_graph=True, allow_unused=True)
                     
-                    trainable_params = [p for p in learner.parameters() if p.requires_grad]
-                    grads = torch.autograd.grad(
-                        support_loss,
-                        trainable_params,
-                        create_graph=True,
-                        allow_unused=True,
-                        retain_graph=True
-                    )
-                    
-                    param_grad_pairs = [(p, g) for p, g in zip(trainable_params, grads) if g is not None]
-                    if not param_grad_pairs:
-                        print("\nWARNING: No valid gradients found in inner loop")
-                        continue
-                        
-                    params, filtered_grads = zip(*param_grad_pairs)
-                    
-                    grad_norm = torch.norm(torch.stack([torch.norm(g) for g in filtered_grads]))
-                    if grad_norm > 10:
-                        scaling_factor = 10 / grad_norm
-                        filtered_grads = [g * scaling_factor for g in filtered_grads]
-                    
-                    for param, grad in zip(params, filtered_grads):
-                        param.data = param.data - learner.lr * grad
+                    # Apply per-layer learning rates
+                    for (name, param), grad in zip(learner.named_parameters(), grads):
+                        if grad is not None:
+                            lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
+                            param.data = param.data - lr.abs() * grad
                 
+                # Evaluate on query set
                 query_preds = learner(query_images)
                 query_loss = F.binary_cross_entropy_with_logits(
                     query_preds[:, 1], query_labels.squeeze(1).float())
@@ -127,8 +113,8 @@ def train_epoch(model, train_loader, optimizer, device, adaptation_steps, scaler
     
     return total_loss/n_batches, total_acc/n_batches
 
-def validate(model, val_loader, device, adaptation_steps, inner_lr):
-    """Validate using MAML with gradient monitoring."""
+def validate(model, val_loader, device, adaptation_steps, inner_lr=None):
+    """Validate model using per-layer learning rates."""
     model.eval()
     total_val_loss = 0
     total_val_acc = 0
@@ -144,11 +130,15 @@ def validate(model, val_loader, device, adaptation_steps, inner_lr):
             query_images = episode['query_images'].to(device, non_blocking=True)
             query_labels = episode['query_labels'].unsqueeze(1).to(device, non_blocking=True)
 
+            # Clone model for adaptation
             adapted_model = copy.deepcopy(model)
             adapted_model.train()
             
             for param in adapted_model.parameters():
                 param.requires_grad_(True)
+            
+            # Get per-layer learning rates
+            layer_lrs = adapted_model.module.get_layer_lrs()
 
             for step in range(adaptation_steps):
                 support_preds = adapted_model(support_images)
@@ -164,8 +154,11 @@ def validate(model, val_loader, device, adaptation_steps, inner_lr):
                     retain_graph=True
                 )
                 
-                for param, grad in zip(adapted_model.parameters(), grads):
-                    param.data = param.data - inner_lr * grad
+                # Apply per-layer learning rates
+                for (name, param), grad in zip(adapted_model.named_parameters(), grads):
+                    if grad is not None:
+                        lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
+                        param.data = param.data - lr.abs() * grad
 
             adapted_model.eval()
             with torch.no_grad():
@@ -213,8 +206,6 @@ def main():
                         help='Number of adaptation steps during training')
     parser.add_argument('--test_adaptation_steps', type=int, default=15,
                         help='Number of adaptation steps during testing')
-    parser.add_argument('--inner_lr', type=float, default=0.05,
-                        help='Inner loop learning rate')
     parser.add_argument('--outer_lr', type=float, default=0.001,
                         help='Outer loop learning rate')
     args = parser.parse_args()
@@ -258,7 +249,7 @@ def main():
         
         maml = l2l.algorithms.MAML(
             model, 
-            lr=args.inner_lr, 
+            lr=None,  # Set to None to use per-layer learning rates
             first_order=False,
             allow_unused=True,
             allow_nograd=True
@@ -286,7 +277,7 @@ def main():
                 
                 val_loss, val_acc = validate(
                     maml, val_loader, device,
-                    args.adaptation_steps, args.inner_lr
+                    args.adaptation_steps
                 )
                 
                 print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -334,7 +325,7 @@ def main():
             
             test_loss, test_acc = validate(
                 maml, test_loader, device, 
-                args.test_adaptation_steps, args.inner_lr
+                args.test_adaptation_steps
             )
             
             test_results[task] = {

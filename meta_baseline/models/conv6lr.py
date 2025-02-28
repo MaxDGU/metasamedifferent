@@ -153,7 +153,7 @@ class SameDifferentCNN(nn.Module):
     def __init__(self):
         super(SameDifferentCNN, self).__init__()
         
-        # 6-layer CNN with increasing filter counts
+        # 6-layer CNN from Kim et al.
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32, track_running_stats=False)
         
