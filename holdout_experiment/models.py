@@ -12,6 +12,7 @@ import random
 from conv6lr import SameDifferentCNN, accuracy, EarlyStopping, SameDifferentDataset
 import sys
 
+#pb tasks and SVRT, can ablate either from training or testing; used only PB tasks in paper experiments
 svrt_tasks = ['1', '7', '5', '15', '16', '19', '20', '21', '22']
 pb_tasks = ['regular', 'lines', 'open', 'wider_line', 'scrambled', 
             'random_color', 'arrows', 'irregular', 'filled', 'original']
@@ -286,6 +287,7 @@ def main(held_out_task, seed=None, save_path='model.pt', data_dir=None, return_m
                 'acc': f'{running_acc/(batch_idx+1):.4f}'
             })
         
+        # Store training metrics
         epoch_loss = running_loss / num_batches
         epoch_acc = running_acc / num_batches
         metrics['train_loss'].append(epoch_loss)
