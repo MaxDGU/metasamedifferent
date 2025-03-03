@@ -4,13 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import learn2learn as l2l
-from learn2learn.data import MetaDataset
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import math
 import random
-from conv6lr import SameDifferentDataset
+from .conv6lr import SameDifferentDataset
 import json
 import argparse
 import gc
@@ -140,8 +139,17 @@ def accuracy(predictions, targets):
         # Convert 2D logits to binary prediction
         predictions = F.softmax(predictions, dim=1)
         predictions = (predictions[:, 1] > 0.5).float()
-        # Convert binary targets to match prediction format
-        targets = targets.squeeze(1)
+        
+        # Safely handle targets of different dimensions
+        if targets.dim() > 1:
+            # If targets has more than 1 dimension, squeeze it to match predictions
+            targets = targets.squeeze()
+            
+            # If after squeezing it still has more than 1 dimension,
+            # take the second column (same as predictions)
+            if targets.dim() > 1 and targets.shape[1] > 1:
+                targets = targets[:, 1]
+        
         return (predictions == targets).float().mean()
 
 def load_model(model_path, model, optimizer=None):
@@ -171,58 +179,56 @@ class EarlyStopping:
             self.best_val = val_acc   
             self.counter = 0
 
-def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=5, max_episodes=200):
+def validate(maml, val_loader, device, adaptation_steps=5, inner_lr=None):
     """Improved validation with learned per-layer learning rates"""
     maml.module.eval()
     val_loss = 0.0
     val_acc = 0.0
     
     # Calculate number of batches to ensure all tasks are represented
-    num_tasks = len(val_dataset.tasks)
-    episodes_per_task = max_episodes // num_tasks
-    num_batches = max_episodes // meta_batch_size
+    num_tasks = len(val_loader.dataset.tasks)
+    episodes_per_task = 200 // num_tasks  # Using 200 as default max_episodes
+    num_batches = len(val_loader)
     
-    task_metrics = {task: {'acc': [], 'loss': []} for task in val_dataset.tasks}
-    pbar = tqdm(range(num_batches), desc="Validating")
+    task_metrics = {task: {'acc': [], 'loss': []} for task in val_loader.dataset.tasks}
+    pbar = tqdm(val_loader, desc="Validating")
                 
-    for _ in pbar:
+    for batch in pbar:
         batch_loss = 0.0
         batch_acc = 0.0
         
-        # Get balanced batch like in training
-        episodes = val_dataset.get_balanced_batch(meta_batch_size)
-        
-        for episode in episodes:
+        for episode in batch:
             task = episode['task']
             learner = maml.clone()
                 
             support_images = episode['support_images'].to(device)
-            support_labels = episode['support_labels'].unsqueeze(1).to(device)
+            support_labels = episode['support_labels'].to(device)
             query_images = episode['query_images'].to(device)
-            query_labels = episode['query_labels'].unsqueeze(1).to(device)
+            query_labels = episode['query_labels'].to(device)
                 
-                # Inner loop adaptation
+            # Inner loop adaptation
             layer_lrs = learner.module.get_layer_lrs()
-            for _ in range(num_adaptation_steps):
-                support_preds = learner(support_images)
-            # Use BCE loss for support set
-            support_loss = F.binary_cross_entropy_with_logits(
-                support_preds[:, 1], support_labels.squeeze(1).float())
+            for _ in range(adaptation_steps):
+                with torch.amp.autocast(device_type=device.type):
+                    support_preds = learner(support_images)
+                # Use BCE loss for support set - ensure labels are properly formatted
+                support_loss = F.binary_cross_entropy_with_logits(
+                    support_preds[:, 1], support_labels.float())
             
-            grads = torch.autograd.grad(support_loss, learner.parameters(),
-                                        create_graph=True,
-                                        allow_unused=True)
-            
-            for (name, param), grad in zip(learner.named_parameters(), grads):
-                if grad is not None:
-                    lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
-                    param.data = param.data - lr.abs() * grad
+                grads = torch.autograd.grad(support_loss, learner.parameters(),
+                                            create_graph=True,
+                                            allow_unused=True)
+                
+                for (name, param), grad in zip(learner.named_parameters(), grads):
+                    if grad is not None:
+                        lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
+                        param.data = param.data - lr.abs() * grad
                 
             with torch.no_grad():
                 query_preds = learner(query_images)
-                # Use BCE loss for query set
+                # Use BCE loss for query set - ensure labels are properly formatted
                 query_loss = F.binary_cross_entropy_with_logits(
-                    query_preds[:, 1], query_labels.squeeze(1).float())
+                    query_preds[:, 1], query_labels.float())
                 query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss.item()
@@ -231,8 +237,8 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
             task_metrics[task]['acc'].append(query_acc.item())
             task_metrics[task]['loss'].append(query_loss.item())
         
-        batch_loss /= len(episodes)
-        batch_acc /= len(episodes)
+        batch_loss /= len(batch)
+        batch_acc /= len(batch)
         val_loss += batch_loss
         val_acc += batch_acc
                 
@@ -286,31 +292,31 @@ def train_epoch(maml, train_loader, optimizer, device, adaptation_steps, scaler)
                     
                 # Inner loop adaptation
                 for _ in range(adaptation_steps):
-                    support_preds = learner(support_images)
+                    with torch.amp.autocast(device_type=device.type):
+                        support_preds = learner(support_images)
                     support_loss = F.binary_cross_entropy_with_logits(
                         support_preds[:, 1], support_labels.float())
                     learner.adapt(support_loss)
                     
                 # Evaluate on query set with mixed precision
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type=device.type):
                     query_preds = learner(query_images)
                     query_loss = F.binary_cross_entropy_with_logits(
                         query_preds[:, 1], query_labels.float())
                     query_acc = accuracy(query_preds, query_labels)
-                    
-                # Scale loss and backward pass
-                scaled_loss = scaler.scale(query_loss)
-                scaled_loss.backward()
-                    
+                
+                # Scale loss for mixed precision training
+                if scaler is not None:
+                    scaler.scale(query_loss).backward()
+                else:
+                    query_loss.backward()
+                
                 batch_loss += query_loss.item()
                 batch_acc += query_acc.item()
-                    
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"WARNING: GPU OOM error in batch. Trying to recover...")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        gc.collect()
+                    print(f"WARNING: GPU OOM error. Skipping this episode.")
+                    torch.cuda.empty_cache()
                     continue
                 else:
                     raise e
@@ -337,10 +343,10 @@ def train_epoch(maml, train_loader, optimizer, device, adaptation_steps, scaler)
     
     return total_loss / num_batches, total_acc / num_batches
 
-def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
+def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
     """Main training function with support for resuming from checkpoint"""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='data/pb/pb',
+    parser.add_argument('--data_dir', type=str, default='data/meta_h5/pb',
                       help='Directory containing the PB dataset')
     parser.add_argument('--output_dir', type=str, default='results/meta_baselines',
                       help='Directory to save results')
@@ -364,10 +370,10 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
     
     # Check CUDA availability
     if not torch.cuda.is_available():
-        print("CUDA is not available. This script requires GPU access.")
-        sys.exit(1)
-    
-    device = torch.device('cuda')
+        print("WARNING: CUDA is not available. Running on CPU, but this will be slow and may not work correctly.")
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda')
     print(f"Using device: {device}")
     
     try:
@@ -427,7 +433,11 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
             param.requires_grad = True
         
         optimizer = torch.optim.Adam(maml.parameters(), lr=args.outer_lr)
-        scaler = torch.cuda.amp.GradScaler()
+        # Initialize mixed precision scaler
+        if device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+        else:
+            scaler = None
         
         # Training loop
         print("\nStarting training...")
@@ -448,7 +458,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
                 # Validate
                 val_loss, val_acc = validate(
                     maml, val_loader, device,
-                    args.adaptation_steps, args.inner_lr
+                    adaptation_steps=args.adaptation_steps
                 )
                 
                 print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -499,7 +509,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
             
             test_loss, test_acc = validate(
                 maml, test_loader, device,
-                args.test_adaptation_steps, args.inner_lr
+                adaptation_steps=args.test_adaptation_steps
             )
             
             test_results[task] = {
@@ -523,7 +533,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
             json.dump(results, f, indent=4)
         
         print(f"\nResults saved to: {arch_dir}")
-    
+
     except Exception as e:
         print(f"\nERROR: Training failed with error: {str(e)}")
         sys.exit(1)

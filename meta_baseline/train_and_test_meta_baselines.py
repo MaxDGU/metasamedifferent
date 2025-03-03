@@ -29,7 +29,7 @@ ARCHITECTURES = {
 }
 
 def accuracy(predictions, targets):
-    """Calculate binary classification accuracy using second logit."""
+    """binary classification accuracy - predictions are list of logits, targets are list of labels"""
     predicted_labels = (predictions[:, 1] > 0.0).float()
     return (predicted_labels == targets.squeeze(1)).float().mean()
 
@@ -211,10 +211,12 @@ def main():
     args = parser.parse_args()
     
     try:
+        # Check for CUDA
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. This script requires GPU access.")
-        device = torch.device('cuda')
-        print(f"Using device: {device}")
+            print("WARNING: CUDA is not available. Running on CPU, but this will be slow and may not work correctly.")
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cuda')
         
         if not os.path.exists(args.data_dir):
             raise FileNotFoundError(f"Data directory not found: {args.data_dir}")

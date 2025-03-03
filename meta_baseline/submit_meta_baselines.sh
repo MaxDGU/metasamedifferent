@@ -34,7 +34,7 @@ SEED=${SEEDS[$seed_idx]}
 echo "Running architecture: $ARCH with seed: $SEED"
 
 # Run the training and testing script
-python -m meta_baseline.train_and_test_meta_baselines \
+python -m train_and_test_meta_baselines \
     --data_dir data/pb/pb \
     --output_dir results/meta_baselines \
     --architecture $ARCH \

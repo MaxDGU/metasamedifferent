@@ -280,11 +280,22 @@ class SameDifferentCNN(nn.Module):
         return lrs
 
 def accuracy(predictions, targets):
-    """Calculate binary classification accuracy"""
+    """Calculate binary classification accuracy."""
     with torch.no_grad():
+        # Convert 2D logits to binary prediction
         predictions = F.softmax(predictions, dim=1)
         predictions = (predictions[:, 1] > 0.5).float()
-        targets = targets.squeeze(1)
+        
+        # Safely handle targets of different dimensions
+        if targets.dim() > 1:
+            # If targets has more than 1 dimension, squeeze it to match predictions
+            targets = targets.squeeze()
+            
+            # If after squeezing it still has more than 1 dimension,
+            # take the second column (same as predictions)
+            if targets.dim() > 1 and targets.shape[1] > 1:
+                targets = targets[:, 1]
+        
         return (predictions == targets).float().mean()
 
 def load_model(model_path, model, optimizer=None):
@@ -315,39 +326,37 @@ class EarlyStopping:
             self.best_val = val_acc   
             self.counter = 0
 
-def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=5, max_episodes=200):
+def validate(maml, val_loader, device, adaptation_steps=5, inner_lr=None):
     """Validation with learned per-layer learning rates"""
     maml.module.eval()
     val_loss = 0.0
     val_acc = 0.0
     
-    num_tasks = len(val_dataset.tasks)
-    episodes_per_task = max_episodes // num_tasks
-    num_batches = max_episodes // meta_batch_size
+    num_tasks = len(val_loader.dataset.tasks)
+    episodes_per_task = 200 // num_tasks  # Using 200 as default max_episodes
+    num_batches = len(val_loader)
     
-    task_metrics = {task: {'acc': [], 'loss': []} for task in val_dataset.tasks}
-    pbar = tqdm(range(num_batches), desc="Validating")
+    task_metrics = {task: {'acc': [], 'loss': []} for task in val_loader.dataset.tasks}
+    pbar = tqdm(val_loader, desc="Validating")
     
-    for _ in pbar:
+    for batch in pbar:
         batch_loss = 0.0
         batch_acc = 0.0
         
-        episodes = val_dataset.get_balanced_batch(meta_batch_size)
-        
-        for episode in episodes:
+        for episode in batch:
             task = episode['task']
             learner = maml.clone()
             
             support_images = episode['support_images'].to(device)
-            support_labels = episode['support_labels'].unsqueeze(1).to(device)
+            support_labels = episode['support_labels'].to(device)
             query_images = episode['query_images'].to(device)
-            query_labels = episode['query_labels'].unsqueeze(1).to(device)
+            query_labels = episode['query_labels'].to(device)
             
             layer_lrs = learner.module.get_layer_lrs()
-            for _ in range(num_adaptation_steps):
+            for _ in range(adaptation_steps):
                 support_preds = learner(support_images)
                 support_loss = F.binary_cross_entropy_with_logits(
-                    support_preds[:, 1], support_labels.squeeze(1).float())
+                    support_preds[:, 1], support_labels.float())
                 
                 grads = torch.autograd.grad(support_loss, learner.parameters(),
                                           create_graph=True,
@@ -361,7 +370,7 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
             with torch.no_grad():
                 query_preds = learner(query_images)
                 query_loss = F.binary_cross_entropy_with_logits(
-                    query_preds[:, 1], query_labels.squeeze(1).float())
+                    query_preds[:, 1], query_labels.float())
                 query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss.item()
@@ -370,8 +379,8 @@ def validate(maml, val_dataset, device, meta_batch_size=8, num_adaptation_steps=
             task_metrics[task]['acc'].append(query_acc.item())
             task_metrics[task]['loss'].append(query_loss.item())
         
-        batch_loss /= len(episodes)
-        batch_acc /= len(episodes)
+        batch_loss /= len(batch)
+        batch_acc /= len(batch)
         val_loss += batch_loss
         val_acc += batch_acc
         
@@ -466,7 +475,6 @@ def train_epoch(maml, train_loader, optimizer, device, adaptation_steps, scaler)
     return total_loss / num_batches, total_acc / num_batches
 
 def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
-    """Main training function with support for resuming from checkpoint"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='data/pb/pb',
                         help='Directory containing the PB dataset')
@@ -492,8 +500,10 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
     
     try:
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. This script requires GPU access.")
-        device = torch.device('cuda')
+            print("WARNING: CUDA is not available. Running on CPU, but this will be slow and may not work correctly.")
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cuda')
         print(f"Using device: {device}")
         
         if not os.path.exists(args.data_dir):
@@ -563,7 +573,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
                 
                 val_loss, val_acc = validate(
                     maml, val_loader, device,
-                    args.adaptation_steps, args.inner_lr
+                    adaptation_steps=args.adaptation_steps
                 )
                 
                 print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -611,7 +621,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
             
             test_loss, test_acc = validate(
                 maml, test_loader, device,
-                args.test_adaptation_steps, args.inner_lr
+                adaptation_steps=args.test_adaptation_steps
             )
             
             test_results[task] = {
