@@ -9,7 +9,10 @@ import numpy as np
 from tqdm import tqdm
 import math
 import random
-from .conv6lr import SameDifferentDataset, validate, accuracy, EarlyStopping, train_epoch, collate_episodes, load_model
+from .utils import (
+    SameDifferentDataset, validate, accuracy, EarlyStopping, 
+    train_epoch, collate_episodes, load_model
+)
 import json
 import argparse
 import gc
