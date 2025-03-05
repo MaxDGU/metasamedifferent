@@ -11,63 +11,7 @@ from PIL import Image
 from torchvision import transforms
 import json
 import argparse
-from .utils import train_epoch, validate, EarlyStopping, train_model
-
-class SameDifferentDataset(Dataset):
-    def __init__(self, data_dir, problem_number, split):
-        """Dataset for loading same-different task PNG data for a specific problem."""
-        self.data_dir = data_dir
-        self.problem_number = problem_number
-        self.split = split
-        
-        # Find the correct problem directory (ignoring timestamps)
-        problem_pattern = f'results_problem_{problem_number}_*'
-        problem_dirs = glob.glob(os.path.join(data_dir, problem_pattern))
-        if not problem_dirs:
-            raise ValueError(f"No directory found for problem {problem_number}")
-        
-        # Use the first matching directory
-        problem_dir = problem_dirs[0]
-        split_dir = os.path.join(problem_dir, split)
-        
-        # Get all PNG files
-        self.image_paths = glob.glob(os.path.join(split_dir, '*.png'))
-        if not self.image_paths:
-            raise ValueError(f"No PNG files found in {split_dir}")
-        
-        # Extract labels from filenames (sample_1_0009 -> 1)
-        self.labels = []
-        for path in self.image_paths:
-            filename = os.path.basename(path)
-            label = int(filename.split('_')[1])  # Get the middle number
-            self.labels.append(label)
-        
-        self.labels = torch.tensor(self.labels)
-        print(f"Loaded {len(self.image_paths)} images for {split} split")
-        print(f"Label distribution: {torch.bincount(self.labels.long())}")
-        
-        # Define image transforms
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-    
-    def __len__(self):
-        return len(self.image_paths)
-    
-    def __getitem__(self, idx):
-        # Load image
-        image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert('RGB')
-        
-        # Apply transforms
-        image = self.transform(image)
-        label = self.labels[idx]
-        
-        return {
-            'image': image,
-            'label': label
-        }
+from .utils import train_epoch, validate, EarlyStopping, train_model, SameDifferentDataset
 
 class SameDifferentCNN(nn.Module):
     def __init__(self):
@@ -146,6 +90,8 @@ class SameDifferentCNN(nn.Module):
         
         return self.classifier(x)
 
+
+#main just to test...
 def main(args):
     """Main entry point for training Conv2 model."""
     args.dataset_class = SameDifferentDataset

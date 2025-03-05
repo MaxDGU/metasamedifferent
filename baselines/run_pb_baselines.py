@@ -5,10 +5,7 @@ import numpy as np
 from itertools import product
 
 # Define tasks and architectures
-PB_TASKS = ['regular', 'lines', 'open', 'wider_line', 'scrambled', 'random_color', 
-            'arrows', 'irregular', 'filled', 'original']  # 10 tasks total
-ARCHITECTURES = ['conv2', 'conv4', 'conv6']
-SEEDS = [47, 48, 49, 50, 51]  # New set of 5 seeds
+from models.utils import PB_TASKS, ARCHITECTURES, SEEDS
 
 def create_array_script(output_dir):
     """Create a Slurm array script for all jobs."""

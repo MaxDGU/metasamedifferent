@@ -13,100 +13,7 @@ from PIL import Image
 from models.conv2 import SameDifferentCNN as Conv2CNN
 from models.conv4 import SameDifferentCNN as Conv4CNN
 from models.conv6 import SameDifferentCNN as Conv6CNN
-
-class PBDataset(Dataset):
-    """Dataset for PB tasks with balanced task representation."""
-    def __init__(self, data_dir, task_names, split='train', support_sizes=[4, 6, 8, 10], transform=None):
-        self.data_dir = data_dir
-        self.task_names = task_names if isinstance(task_names, list) else [task_names]
-        self.split = split
-        self.support_sizes = support_sizes
-        self.transform = transform
-        
-        # Dictionary to store data per task
-        self.task_data = {task: {'images': [], 'labels': []} for task in self.task_names}
-        
-        # Process each task separately
-        for task_name in self.task_names:
-            # Process each support size
-            for support_size in support_sizes:
-                filename = f"{task_name}_support{support_size}_{split}.h5"
-                filepath = os.path.join(data_dir, filename)
-                
-                if not os.path.exists(filepath):
-                    print(f"Warning: File not found: {filepath}")
-                    continue
-                
-                print(f"Loading {filename}")
-                with h5py.File(filepath, 'r') as f:
-                    num_episodes = f['support_images'].shape[0]
-                    
-                    for episode_idx in range(num_episodes):
-                        support_images = f['support_images'][episode_idx]
-                        support_labels = f['support_labels'][episode_idx]
-                        query_images = f['query_images'][episode_idx]
-                        query_labels = f['query_labels'][episode_idx]
-                        
-                        all_images = np.concatenate([support_images, query_images])
-                        all_labels = np.concatenate([support_labels, query_labels])
-                        
-                        self.task_data[task_name]['images'].extend(all_images)
-                        self.task_data[task_name]['labels'].extend(all_labels)
-            
-            # Convert to numpy arrays
-            self.task_data[task_name]['images'] = np.array(self.task_data[task_name]['images'])
-            self.task_data[task_name]['labels'] = np.array(self.task_data[task_name]['labels'])
-            
-            print(f"Loaded {len(self.task_data[task_name]['images'])} images for task {task_name}")
-            print(f"Label distribution: {np.bincount(self.task_data[task_name]['labels'].astype(int))}")
-        
-        # Calculate total size and samples per task per batch
-        self.total_size = sum(len(data['images']) for data in self.task_data.values())
-        self.samples_per_task = min(len(data['images']) for data in self.task_data.values())
-        
-        # Create indices for balanced sampling
-        self.task_indices = {
-            task: np.arange(len(data['images'])) 
-            for task, data in self.task_data.items()
-        }
-        
-        # Shuffle indices for each task
-        for indices in self.task_indices.values():
-            np.random.shuffle(indices)
-        
-        # Keep track of current position in each task
-        self.current_pos = {task: 0 for task in self.task_names}
-    
-    def __len__(self):
-        # Return the size that ensures all tasks are seen equally
-        return self.samples_per_task * len(self.task_names)
-    
-    def __getitem__(self, idx):
-        # Determine which task to sample from
-        task_idx = idx % len(self.task_names)
-        task_name = self.task_names[task_idx]
-        
-        # Get current position for this task
-        pos = self.current_pos[task_name]
-        if pos >= len(self.task_indices[task_name]):
-            # Reshuffle indices if we've gone through all samples
-            np.random.shuffle(self.task_indices[task_name])
-            self.current_pos[task_name] = 0
-            pos = 0
-        
-        # Get the actual index from our shuffled indices
-        actual_idx = self.task_indices[task_name][pos]
-        self.current_pos[task_name] += 1
-        
-        # Get the image and label
-        image = self.task_data[task_name]['images'][actual_idx]
-        label = self.task_data[task_name]['labels'][actual_idx]
-        
-        # Convert to float and normalize to [-1, 1]
-        image = torch.FloatTensor(image.transpose(2, 0, 1)) / 127.5 - 1.0
-        label = torch.tensor(int(label))
-        
-        return {'image': image, 'label': label, 'task': task_name}
+from models.utils import SameDifferentDataset, train_epoch, validate, EarlyStopping
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -118,70 +25,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    """Train for one epoch."""
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    
-    progress_bar = tqdm(train_loader, desc='Training')
-    for batch in progress_bar:
-        images = batch['image'].to(device)
-        labels = batch['label'].to(device).float()
-        
-        optimizer.zero_grad()
-        outputs = model(images)
-        
-        loss = criterion(outputs[:, 1], labels)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
-        probs = torch.sigmoid(outputs[:, 1])
-        predicted = (probs >= 0.5).float()
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        # Update progress bar with overall metrics
-        progress_bar.set_postfix({
-            'loss': f'{running_loss/total:.3f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-    
-    return running_loss/len(train_loader), correct/total
-
-def validate(model, val_loader, criterion, device):
-    """Validate the model."""
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        progress_bar = tqdm(val_loader, desc='Validation')
-        for batch in progress_bar:
-            images = batch['image'].to(device)
-            labels = batch['label'].to(device).float()  # Convert to float for BCE loss
-            
-            outputs = model(images)
-            
-            # Use second column of outputs for binary prediction
-            loss = criterion(outputs[:, 1], labels)
-            
-            running_loss += loss.item()
-            # Calculate accuracy using probabilities
-            probs = torch.sigmoid(outputs[:, 1])  # Convert logits to probabilities
-            predicted = (probs >= 0.5).float()  # Use 0.5 threshold on probabilities
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            progress_bar.set_postfix({
-                'loss': f'{running_loss/total:.3f}',
-                'acc': f'{100.*correct/total:.2f}%'
-            })
-    
-    return running_loss/len(val_loader), correct/total
 
 def main():
     parser = argparse.ArgumentParser()
@@ -214,10 +57,10 @@ def main():
     
     # Create datasets and dataloaders
     # Training on all tasks
-    train_dataset = PBDataset(args.data_dir, PB_TASKS, split='train')
+    train_dataset = SameDifferentDataset(args.data_dir, PB_TASKS, split='train')
     # Validation and testing on specified task only
-    val_dataset = PBDataset(args.data_dir, args.test_task, split='val')
-    test_dataset = PBDataset(args.data_dir, args.test_task, split='test')
+    val_dataset = SameDifferentDataset(args.data_dir, args.test_task, split='val')
+    test_dataset = SameDifferentDataset(args.data_dir, args.test_task, split='test')
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
@@ -239,8 +82,8 @@ def main():
     
     # Training loop
     best_val_acc = 0
-    patience_counter = 0
     training_history = []
+    early_stopping = EarlyStopping(patience=args.patience, min_delta=args.improvement_threshold)
     
     for epoch in range(args.epochs):
         print(f'\nEpoch {epoch+1}/{args.epochs}')
@@ -262,10 +105,9 @@ def main():
                 'val_acc': val_acc
             })
             
-            # Check if validation accuracy improved by at least improvement_threshold
-            if val_acc > (best_val_acc + args.improvement_threshold):
+            # Check if validation accuracy improved
+            if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                patience_counter = 0
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -273,17 +115,15 @@ def main():
                     'val_loss': val_loss,
                     'val_acc': val_acc
                 }, os.path.join(model_dir, 'best_model.pt'))
-                print(f'Validation accuracy improved by more than {args.improvement_threshold*100}%!')
-            else:
-                patience_counter += 1
-                print(f'No significant improvement. Patience: {patience_counter}/{args.patience}')
+                print(f'New best validation accuracy: {val_acc*100:.2f}%')
             
             print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}%')
             print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%')
             print(f'Best Val Acc: {best_val_acc*100:.2f}%')
             
-            # Early stopping
-            if patience_counter >= args.patience:
+            # Early stopping check
+            early_stopping(val_acc)
+            if early_stopping.should_stop:
                 print(f'Early stopping triggered after epoch {epoch+1}')
                 print(f'No improvement of {args.improvement_threshold*100}% or more in validation accuracy for {args.patience} validations')
                 break

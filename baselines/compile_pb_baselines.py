@@ -2,14 +2,11 @@ import os
 import json
 import numpy as np
 from pathlib import Path
+from models.utils import PB_TASKS, ARCHITECTURES, SEEDS
 
-#TO BE RUN after all seeds have been trained
-PB_TASKS = [
-    'regular', 'lines', 'open', 'wider_line', 'scrambled',
-    'random_color', 'arrows', 'irregular', 'filled', 'original'
-]
-ARCHITECTURES = ['conv2', 'conv4', 'conv6']
-SEEDS = [47, 48, 49, 50, 51] 
+
+#this file TO BE RUN AFTER all seeds have been trained
+
 
 def compile_results(base_dir='results/pb_baselines'):
     """Compile test accuracies across all architectures, tasks, and seeds."""
