@@ -9,7 +9,7 @@ import numpy as np
 from tqdm import tqdm
 import math
 import random
-from .utils import (
+from .utils_meta import (
     SameDifferentDataset, validate, accuracy, EarlyStopping, 
     train_epoch, collate_episodes, load_model
 )
@@ -137,10 +137,10 @@ class SameDifferentCNN(nn.Module):
         
         return lrs
 
-def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
+def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
     """Main training function with support for resuming from checkpoint"""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='data/meta_h5/pb',
+    parser.add_argument('--data_dir', type=str, default='data/pb/pb',
                       help='Directory containing the PB dataset')
     parser.add_argument('--output_dir', type=str, default='results/meta_baselines',
                       help='Directory to save results')

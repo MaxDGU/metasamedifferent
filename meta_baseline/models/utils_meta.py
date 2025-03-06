@@ -104,6 +104,10 @@ class SameDifferentDataset(Dataset):
             query_images = torch.from_numpy(f['query_images'][idx]).float() / 255.0
             query_labels = torch.from_numpy(f['query_labels'][idx]).long()
         
+        # Convert from NHWC to NCHW format
+        support_images = support_images.permute(0, 3, 1, 2)
+        query_images = query_images.permute(0, 3, 1, 2)
+        
         return {
             'support_images': support_images,
             'support_labels': support_labels,
@@ -216,25 +220,26 @@ def validate(maml, val_loader, device, adaptation_steps=5, inner_lr=None):
             query_labels = episode['query_labels'].to(device)
             
             layer_lrs = learner.module.get_layer_lrs()
-            for _ in range(adaptation_steps):
-                support_preds = learner(support_images)
-                support_loss = F.binary_cross_entropy_with_logits(
-                    support_preds[:, 1], support_labels.float())
+            with torch.cuda.amp.autocast():
+                for _ in range(adaptation_steps):
+                    support_preds = learner(support_images)
+                    support_loss = F.binary_cross_entropy_with_logits(
+                        support_preds[:, 1], support_labels.float())
+                    
+                    grads = torch.autograd.grad(support_loss, learner.parameters(),
+                                              create_graph=True,
+                                              allow_unused=True)
+                    
+                    for (name, param), grad in zip(learner.named_parameters(), grads):
+                        if grad is not None:
+                            lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
+                            param.data = param.data - lr.abs() * grad
                 
-                grads = torch.autograd.grad(support_loss, learner.parameters(),
-                                          create_graph=True,
-                                          allow_unused=True)
-                
-                for (name, param), grad in zip(learner.named_parameters(), grads):
-                    if grad is not None:
-                        lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
-                        param.data = param.data - lr.abs() * grad
-            
-            with torch.no_grad():
-                query_preds = learner(query_images)
-                query_loss = F.binary_cross_entropy_with_logits(
-                    query_preds[:, 1], query_labels.float())
-                query_acc = accuracy(query_preds, query_labels)
+                with torch.no_grad():
+                    query_preds = learner(query_images)
+                    query_loss = F.binary_cross_entropy_with_logits(
+                        query_preds[:, 1], query_labels.float())
+                    query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss.item()
             batch_acc += query_acc.item()
@@ -290,20 +295,22 @@ def train_epoch(maml, train_loader, optimizer, device, adaptation_steps, scaler)
                 query_images = episode['query_images'].to(device, non_blocking=True)
                 query_labels = episode['query_labels'].to(device, non_blocking=True)
                 
-                for _ in range(adaptation_steps):
-                    support_preds = learner(support_images)
-                    support_loss = F.binary_cross_entropy_with_logits(
-                        support_preds[:, 1], support_labels.float())
-                    learner.adapt(support_loss)
-                
                 with torch.cuda.amp.autocast():
+                    # Inner loop adaptation
+                    for _ in range(adaptation_steps):
+                        support_preds = learner(support_images)
+                        support_loss = F.binary_cross_entropy_with_logits(
+                            support_preds[:, 1], support_labels.float())
+                        learner.adapt(support_loss, allow_unused=True, allow_nograd=True)
+                    
+                    # Evaluate on query set
                     query_preds = learner(query_images)
                     query_loss = F.binary_cross_entropy_with_logits(
                         query_preds[:, 1], query_labels.float())
                     query_acc = accuracy(query_preds, query_labels)
                 
                 scaled_loss = scaler.scale(query_loss)
-                scaled_loss.backward()
+                scaled_loss.backward(retain_graph=True)  # Add retain_graph=True
                 
                 batch_loss += query_loss.item()
                 batch_acc += query_acc.item()

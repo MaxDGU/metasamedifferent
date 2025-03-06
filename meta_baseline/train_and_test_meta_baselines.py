@@ -251,7 +251,7 @@ def main():
         
         maml = l2l.algorithms.MAML(
             model, 
-            lr=None,  # Set to None to use per-layer learning rates
+            lr=0.05,  # Set a default learning rate
             first_order=False,
             allow_unused=True,
             allow_nograd=True
