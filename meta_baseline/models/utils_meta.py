@@ -196,145 +196,327 @@ class EarlyStopping:
 def validate(maml, val_loader, device, adaptation_steps=5, inner_lr=None):
     """Validation with learned per-layer learning rates"""
     maml.module.eval()
-    val_loss = 0.0
-    val_acc = 0.0
+    total_batches = len(val_loader)
+    processed_batches = 0
+    skipped_batches = 0
+    batch_loss = 0.0
+    batch_acc = 0.0
     
-    num_tasks = len(val_loader.dataset.tasks)
-    episodes_per_task = 200 // num_tasks  # Using 200 as default max_episodes
-    num_batches = len(val_loader)
-    
-    task_metrics = {task: {'acc': [], 'loss': []} for task in val_loader.dataset.tasks}
+    task_metrics = {}
     pbar = tqdm(val_loader, desc="Validating")
     
-    for batch in pbar:
-        batch_loss = 0.0
-        batch_acc = 0.0
-        
-        for episode in batch:
-            task = episode['task']
+    for batch_idx, batch in enumerate(pbar):
+        try:
+            # Get batch data and reshape to merge batch and episode dimensions
+            support_images = batch['support_images'].to(device)  # [B, N, C, H, W]
+            support_labels = batch['support_labels'].to(device)  # [B, N]
+            query_images = batch['query_images'].to(device)    # [B, M, C, H, W]
+            query_labels = batch['query_labels'].to(device)    # [B, M]
+            task = batch['task'][0] if isinstance(batch['task'], list) else batch['task']
+            
+            # Initialize task metrics if not already present
+            if task not in task_metrics:
+                task_metrics[task] = {'acc': [], 'loss': [], 'processed': 0, 'skipped': 0}
+            
+            # Reshape tensors to merge batch and episode dimensions
+            B, N, C, H, W = support_images.shape
+            support_images = support_images.view(-1, C, H, W)  # [B*N, C, H, W]
+            support_labels = support_labels.view(-1)           # [B*N]
+            
+            _, M, _, _, _ = query_images.shape
+            query_images = query_images.view(-1, C, H, W)     # [B*M, C, H, W]
+            query_labels = query_labels.view(-1)              # [B*M]
+            
+            # Clone model for adaptation
             learner = maml.clone()
-            
-            support_images = episode['support_images'].to(device)
-            support_labels = episode['support_labels'].to(device)
-            query_images = episode['query_images'].to(device)
-            query_labels = episode['query_labels'].to(device)
-            
             layer_lrs = learner.module.get_layer_lrs()
-            with torch.cuda.amp.autocast():
-                for _ in range(adaptation_steps):
+            
+            # Adapt on support set
+            for _ in range(adaptation_steps):
+                with torch.amp.autocast('cuda'):  # Updated to new syntax
                     support_preds = learner(support_images)
                     support_loss = F.binary_cross_entropy_with_logits(
-                        support_preds[:, 1], support_labels.float())
+                        support_preds[:, 1], support_labels.float()
+                    )
+                
+                try:
+                    grads = torch.autograd.grad(
+                        support_loss,
+                        learner.parameters(),
+                        create_graph=True,
+                        allow_unused=True,
+                        retain_graph=True
+                    )
                     
-                    grads = torch.autograd.grad(support_loss, learner.parameters(),
-                                              create_graph=True,
-                                              allow_unused=True)
-                    
+                    # Update parameters that have gradients
                     for (name, param), grad in zip(learner.named_parameters(), grads):
                         if grad is not None:
                             lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
                             param.data = param.data - lr.abs() * grad
-                
-                with torch.no_grad():
+                except RuntimeError as e:
+                    if "graph" in str(e):
+                        print(f"Warning: Graph error in validation. Skipping step.")
+                        continue
+                    else:
+                        raise e
+            
+            # Evaluate on query set
+            with torch.no_grad():
+                with torch.amp.autocast('cuda'):  # Updated to new syntax
                     query_preds = learner(query_images)
                     query_loss = F.binary_cross_entropy_with_logits(
-                        query_preds[:, 1], query_labels.float())
+                        query_preds[:, 1], query_labels.float()
+                    )
                     query_acc = accuracy(query_preds, query_labels)
             
             batch_loss += query_loss.item()
             batch_acc += query_acc.item()
+            processed_batches += 1
             
+            # Update task-specific metrics
             task_metrics[task]['acc'].append(query_acc.item())
             task_metrics[task]['loss'].append(query_loss.item())
-        
-        batch_loss /= len(batch)
-        batch_acc /= len(batch)
-        val_loss += batch_loss
-        val_acc += batch_acc
-        
-        task_accs = {task: np.mean(metrics['acc']) if metrics['acc'] else 0.0
-                    for task, metrics in task_metrics.items()}
-        
-        pbar.set_postfix({
-            'loss': f'{batch_loss:.4f}',
-            'acc': f'{batch_acc:.4f}',
-            'task_accs': {t: f'{acc:.2f}' for t, acc in task_accs.items()}
-        })
+            task_metrics[task]['processed'] += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': batch_loss / processed_batches,
+                'acc': batch_acc / processed_batches,
+                'processed': processed_batches,
+                'skipped': skipped_batches
+            })
+            
+            # Clear some memory
+            del support_images, support_labels, query_images, query_labels
+            del learner, layer_lrs, support_preds, query_preds
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\nWarning: GPU OOM error in validation batch {batch_idx}. Task: {task}")
+                skipped_batches += 1
+                task_metrics[task]['skipped'] += 1
+                torch.cuda.empty_cache()
+                
+                # If we're skipping too many batches, raise an error
+                skip_ratio = skipped_batches / (processed_batches + skipped_batches)
+                if skip_ratio > 0.25:  # If we're skipping more than 25% of batches
+                    raise RuntimeError(
+                        f"Skipping too many batches ({skipped_batches}/{processed_batches + skipped_batches}). "
+                        "Try reducing batch size or model complexity."
+                    )
+                continue
+            else:
+                raise e
     
-    print("\nValidation Results by Task:")
-    for task in task_metrics:
-        task_acc = np.mean(task_metrics[task]['acc']) if task_metrics[task]['acc'] else 0.0
-        task_loss = np.mean(task_metrics[task]['loss']) if task_metrics[task]['loss'] else 0.0
-        print(f"{task}: Acc = {task_acc:.4f}, Loss = {task_loss:.4f}")
+    # Only calculate averages if we processed any batches
+    if processed_batches == 0:
+        raise RuntimeError("No batches were processed during validation!")
     
-    return val_loss / num_batches, val_acc / num_batches
+    avg_loss = batch_loss / processed_batches
+    avg_acc = batch_acc / processed_batches
+    
+    # Print detailed metrics
+    print("\nValidation Summary:")
+    print(f"Processed batches: {processed_batches}/{total_batches}")
+    print(f"Skipped batches: {skipped_batches} ({skipped_batches/total_batches*100:.1f}%)")
+    print(f"Average loss: {avg_loss:.4f}")
+    print(f"Average accuracy: {avg_acc:.4f}")
+    
+    print("\nPer-task validation metrics:")
+    for task, metrics in task_metrics.items():
+        if metrics['processed'] > 0:
+            task_acc = np.mean(metrics['acc'])
+            task_loss = np.mean(metrics['loss'])
+            print(f"{task}: Acc = {task_acc:.4f}, Loss = {task_loss:.4f}")
+            print(f"  Processed: {metrics['processed']}, Skipped: {metrics['skipped']}")
+    
+    return avg_loss, avg_acc
 
 def collate_episodes(batch):
-    """Collate function that preserves episodes as a list"""
-    return batch
+    """Collate function that combines episodes into a batch dictionary with padding."""
+    if not batch:
+        return {}
+    
+    # Initialize dictionary with empty lists for each key
+    batch_dict = {
+        'support_images': [],
+        'support_labels': [],
+        'query_images': [],
+        'query_labels': [],
+        'task': [],
+        'support_size': []
+    }
+    
+    # First pass to get maximum sizes
+    max_support = max(episode['support_images'].size(0) for episode in batch)
+    max_query = max(episode['query_images'].size(0) for episode in batch)
+    
+    # Second pass to pad and collect
+    for episode in batch:
+        # Pad support set if needed
+        support_images = episode['support_images']
+        support_labels = episode['support_labels']
+        if support_images.size(0) < max_support:
+            pad_size = max_support - support_images.size(0)
+            support_images = torch.cat([
+                support_images,
+                torch.zeros(pad_size, *support_images.shape[1:], device=support_images.device)
+            ])
+            support_labels = torch.cat([
+                support_labels,
+                torch.zeros(pad_size, device=support_labels.device)
+            ])
+        
+        # Pad query set if needed
+        query_images = episode['query_images']
+        query_labels = episode['query_labels']
+        if query_images.size(0) < max_query:
+            pad_size = max_query - query_images.size(0)
+            query_images = torch.cat([
+                query_images,
+                torch.zeros(pad_size, *query_images.shape[1:], device=query_images.device)
+            ])
+            query_labels = torch.cat([
+                query_labels,
+                torch.zeros(pad_size, device=query_labels.device)
+            ])
+        
+        # Add to batch dictionary
+        batch_dict['support_images'].append(support_images)
+        batch_dict['support_labels'].append(support_labels)
+        batch_dict['query_images'].append(query_images)
+        batch_dict['query_labels'].append(query_labels)
+        batch_dict['task'].append(episode['task'])
+        batch_dict['support_size'].append(episode['support_size'])
+    
+    # Stack tensors
+    batch_dict['support_images'] = torch.stack(batch_dict['support_images'])
+    batch_dict['support_labels'] = torch.stack(batch_dict['support_labels'])
+    batch_dict['query_images'] = torch.stack(batch_dict['query_images'])
+    batch_dict['query_labels'] = torch.stack(batch_dict['query_labels'])
+    
+    # Keep task and support_size as lists
+    batch_dict['task'] = batch_dict['task'][0]  # Just take the first task since they should all be the same
+    batch_dict['support_size'] = batch_dict['support_size'][0]  # Same for support_size
+    
+    return batch_dict
 
 def train_epoch(maml, train_loader, optimizer, device, adaptation_steps, scaler):
-    """Train using MAML with learned per-layer learning rates"""
+    """Train for one epoch."""
     maml.train()
-    total_loss = 0
-    total_acc = 0
-    num_batches = 0
+    total_batches = len(train_loader)
+    batch_loss = 0
+    batch_acc = 0
     
-    pbar = tqdm(train_loader, desc="Training")
-    for batch in pbar:
-        batch_loss = 0
-        batch_acc = 0
+    # Debug: Print initial learning rate gradients
+    print("\nChecking learning rate parameters:")
+    for name, param in maml.module.named_parameters():
+        if 'lr_' in name:
+            print(f"{name}: requires_grad={param.requires_grad}, grad={param.grad}")
+    
+    pbar = tqdm(train_loader, desc='Training')
+    for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
         
-        for episode in batch:
-            try:
-                learner = maml.clone()
+        try:
+            # Get batch data and reshape to merge batch and episode dimensions
+            support_images = batch['support_images'].to(device)  # [B, N, C, H, W]
+            support_labels = batch['support_labels'].to(device)  # [B, N]
+            query_images = batch['query_images'].to(device)    # [B, M, C, H, W]
+            query_labels = batch['query_labels'].to(device)    # [B, M]
+            
+            # Reshape tensors to merge batch and episode dimensions
+            B, N, C, H, W = support_images.shape
+            support_images = support_images.view(-1, C, H, W)  # [B*N, C, H, W]
+            support_labels = support_labels.view(-1)           # [B*N]
+            
+            _, M, _, _, _ = query_images.shape
+            query_images = query_images.view(-1, C, H, W)     # [B*M, C, H, W]
+            query_labels = query_labels.view(-1)              # [B*M]
+            
+            # Adapt the model on the support set
+            learner = maml.clone()
+            
+            # Debug: Print learning rates being used
+            if batch_idx == 0:
+                print("\nLearning rates for first batch:")
+                layer_lrs = learner.module.get_layer_lrs()
+                for name, lr in layer_lrs.items():
+                    print(f"{name}: lr={lr.item()}")
+            
+            for _ in range(adaptation_steps):
+                with torch.amp.autocast('cuda'):  # Updated to new syntax
+                    support_preds = learner(support_images)
+                    support_loss = F.binary_cross_entropy_with_logits(
+                        support_preds[:, 1], support_labels.float()
+                    )
                 
-                support_images = episode['support_images'].to(device, non_blocking=True)
-                support_labels = episode['support_labels'].to(device, non_blocking=True)
-                query_images = episode['query_images'].to(device, non_blocking=True)
-                query_labels = episode['query_labels'].to(device, non_blocking=True)
-                
-                with torch.cuda.amp.autocast():
-                    # Inner loop adaptation
-                    for _ in range(adaptation_steps):
-                        support_preds = learner(support_images)
-                        support_loss = F.binary_cross_entropy_with_logits(
-                            support_preds[:, 1], support_labels.float())
-                        learner.adapt(support_loss, allow_unused=True, allow_nograd=True)
+                try:
+                    # Compute gradients with allow_unused=True
+                    grads = torch.autograd.grad(
+                        support_loss,
+                        learner.parameters(),
+                        create_graph=True,
+                        allow_unused=True,
+                        retain_graph=True
+                    )
                     
-                    # Evaluate on query set
-                    query_preds = learner(query_images)
-                    query_loss = F.binary_cross_entropy_with_logits(
-                        query_preds[:, 1], query_labels.float())
-                    query_acc = accuracy(query_preds, query_labels)
-                
-                scaled_loss = scaler.scale(query_loss)
-                scaled_loss.backward(retain_graph=True)  # Add retain_graph=True
-                
-                batch_loss += query_loss.item()
-                batch_acc += query_acc.item()
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"WARNING: GPU OOM error in batch. Skipping...")
-                    torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise e
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        batch_loss /= len(batch)
-        batch_acc /= len(batch)
-        total_loss += batch_loss
-        total_acc += batch_acc
-        num_batches += 1
-        
-        pbar.set_postfix({
-            'loss': f'{batch_loss:.4f}',
-            'acc': f'{batch_acc:.4f}'
-        })
+                    # Update parameters that have gradients
+                    layer_lrs = learner.module.get_layer_lrs()
+                    for (name, param), grad in zip(learner.named_parameters(), grads):
+                        if grad is not None:  # Only update if gradient exists
+                            lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
+                            param.data = param.data - lr.abs() * grad
+                except RuntimeError as e:
+                    if "graph" in str(e):
+                        print(f"Warning: Graph error in adaptation. Skipping step.")
+                        continue
+                    else:
+                        raise e
+            
+            # Evaluate on query set
+            with torch.amp.autocast('cuda'):  # Updated to new syntax
+                query_preds = learner(query_images)
+                query_loss = F.binary_cross_entropy_with_logits(
+                    query_preds[:, 1], query_labels.float()
+                )
+                query_acc = accuracy(query_preds, query_labels)
+            
+            # Scale loss and compute gradients
+            scaled_loss = scaler.scale(query_loss)
+            scaled_loss.backward(retain_graph=True)
+            
+            # Debug: Print learning rate gradients after backward
+            if batch_idx == 0:
+                print("\nLearning rate gradients after backward:")
+                for name, param in maml.module.named_parameters():
+                    if 'lr_' in name:
+                        print(f"{name}: grad={param.grad}")
+            
+            # Unscale gradients and check for infs/nans
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(maml.parameters(), 1.0)
+            
+            # Update weights if gradients are valid
+            scaler.step(optimizer)
+            scaler.update()
+            
+            batch_loss += query_loss.item()
+            batch_acc += query_acc.item()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': batch_loss / (batch_idx + 1),
+                'acc': batch_acc / (batch_idx + 1)
+            })
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"WARNING: GPU OOM error in batch. Skipping...")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
     
-    return total_loss / num_batches, total_acc / num_batches 
+    return batch_loss / total_batches, batch_acc / total_batches 

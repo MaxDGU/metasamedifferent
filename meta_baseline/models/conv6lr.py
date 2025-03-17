@@ -68,15 +68,6 @@ class SameDifferentCNN(nn.Module):
         self.classifier = nn.Linear(256, 2)
         self.temperature = nn.Parameter(torch.ones(1))
         
-        # Learnable per-layer learning rates
-        self.lr_conv = nn.ParameterList([
-            nn.Parameter(torch.ones(1) * 0.01) for _ in range(6)
-        ])
-        self.lr_fc = nn.ParameterList([
-            nn.Parameter(torch.ones(1) * 0.01) for _ in range(3)
-        ])
-        self.lr_classifier = nn.Parameter(torch.ones(1) * 0.01)
-        
         self._initialize_weights()
     
     def _initialize_size(self):
@@ -129,25 +120,6 @@ class SameDifferentCNN(nn.Module):
         
         x = self.classifier(x)
         return F.softmax(x / self.temperature.abs(), dim=1)
-    
-    def get_layer_lrs(self):
-        """Return a dictionary mapping parameters to their learning rates"""
-        lrs = {}
-        
-        for i, (conv, bn) in enumerate(zip(
-            [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6],
-            [self.bn1, self.bn2, self.bn3, self.bn4, self.bn5, self.bn6]
-        )):
-            lrs.update({name: self.lr_conv[i].abs() for name, _ in conv.named_parameters()})
-            lrs.update({name: self.lr_conv[i].abs() for name, _ in bn.named_parameters()})
-        
-        for i, (fc, ln) in enumerate(zip(self.fc_layers, self.layer_norms)):
-            lrs.update({name: self.lr_fc[i].abs() for name, _ in fc.named_parameters()})
-            lrs.update({name: self.lr_fc[i].abs() for name, _ in ln.named_parameters()})
-        
-        lrs.update({name: self.lr_classifier.abs() for name, _ in self.classifier.named_parameters()})
-        
-        return lrs
 
 def main(seed=None, output_dir=None, pb_data_dir='data/pb/pb'):
     parser = argparse.ArgumentParser()

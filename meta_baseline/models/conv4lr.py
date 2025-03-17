@@ -65,15 +65,6 @@ class SameDifferentCNN(nn.Module):
         self.classifier = nn.Linear(128, 2)
         self.temperature = nn.Parameter(torch.ones(1))
         
-        # Learnable per-layer learning rates: initialized to 0.01
-        self.lr_conv = nn.ParameterList([
-            nn.Parameter(torch.ones(1) * 0.01) for _ in range(4)
-        ])
-        self.lr_fc = nn.ParameterList([
-            nn.Parameter(torch.ones(1) * 0.01) for _ in range(3)
-        ])
-        self.lr_classifier = nn.Parameter(torch.ones(1) * 0.01)
-        
         self._initialize_weights()
     
     def _initialize_size(self):
@@ -82,14 +73,15 @@ class SameDifferentCNN(nn.Module):
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
         x = self.pool(F.relu(self.bn3(self.conv3(x))))
         x = self.pool(F.relu(self.bn4(self.conv4(x))))
-        x = x.reshape(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)    
         self._to_linear = x.size(1)
     
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                nn.init.constant_(m.bias, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.01)
             elif isinstance(m, nn.Linear) and m != self.classifier:
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 nn.init.constant_(m.bias, 0.01)
@@ -117,25 +109,6 @@ class SameDifferentCNN(nn.Module):
         
         x = self.classifier(x)
         return F.softmax(x / self.temperature.abs(), dim=1)
-    
-    def get_layer_lrs(self):
-        """Return a dictionary mapping parameters to their learning rates"""
-        lrs = {}
-        
-        for i, (conv, bn) in enumerate(zip(
-            [self.conv1, self.conv2, self.conv3, self.conv4],
-            [self.bn1, self.bn2, self.bn3, self.bn4]
-        )):
-            lrs.update({name: self.lr_conv[i].abs() for name, _ in conv.named_parameters()})
-            lrs.update({name: self.lr_conv[i].abs() for name, _ in bn.named_parameters()})
-        
-        for i, (fc, ln) in enumerate(zip(self.fc_layers, self.layer_norms)):
-            lrs.update({name: self.lr_fc[i].abs() for name, _ in fc.named_parameters()})
-            lrs.update({name: self.lr_fc[i].abs() for name, _ in ln.named_parameters()})
-        
-        lrs.update({name: self.lr_classifier.abs() for name, _ in self.classifier.named_parameters()})
-        
-        return lrs
 
 #for testing in the home directory...
 def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
@@ -144,27 +117,13 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
                         help='Directory containing the PB dataset')
     parser.add_argument('--output_dir', type=str, default='results/meta_baselines',
                         help='Directory to save results')
-    parser.add_argument('--seed', type=int, required=True,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for training and testing')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
-    parser.add_argument('--support_size', type=int, default=10,
-                        help='Number of support examples per class')
-    parser.add_argument('--adaptation_steps', type=int, default=5,
-                        help='Number of adaptation steps during training')
-    parser.add_argument('--test_adaptation_steps', type=int, default=15,
-                        help='Number of adaptation steps during testing')
-    parser.add_argument('--inner_lr', type=float, default=0.05,
-                        help='Inner loop learning rate')
-    parser.add_argument('--outer_lr', type=float, default=0.001,
-                        help='Outer loop learning rate')
     args = parser.parse_args()
     
     try:
         if not torch.cuda.is_available():
-            print("WARNING: CUDA is not available. Running on CPU, but this will be slow and may not work correctly.")
+            print("WARNING: CUDA is not available. Running on CPU.")
             device = torch.device('cpu')
         else:
             device = torch.device('cuda')
@@ -177,19 +136,23 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
             torch.manual_seed(args.seed)
             np.random.seed(args.seed)
             random.seed(args.seed)
-            torch.cuda.manual_seed(args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(args.seed)
+                torch.cuda.manual_seed_all(args.seed)
+                torch.backends.cudnn.deterministic = True
         
         arch_dir = os.path.join(args.output_dir, 'conv4', f'seed_{args.seed}')
         os.makedirs(arch_dir, exist_ok=True)
         
         print("\nCreating datasets...")
-        train_dataset = SameDifferentDataset(args.data_dir, train_tasks, 'train', support_sizes=[args.support_size])
-        val_dataset = SameDifferentDataset(args.data_dir, train_tasks, 'val', support_sizes=[args.support_size])
+        train_dataset = SameDifferentDataset(args.data_dir, train_tasks, 'train')
+        val_dataset = SameDifferentDataset(args.data_dir, train_tasks, 'val')
         
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
-                                num_workers=4, pin_memory=True, collate_fn=collate_episodes)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
-                              num_workers=4, pin_memory=True, collate_fn=collate_episodes)
+        # Create dataloaders with reduced num_workers for stability
+        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, 
+                                num_workers=2, pin_memory=True, collate_fn=collate_episodes)
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, 
+                              num_workers=2, pin_memory=True, collate_fn=collate_episodes)
         
         print("\nCreating conv4 model")
         model = SameDifferentCNN().to(device)
@@ -207,7 +170,7 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
         
         maml = l2l.algorithms.MAML(
             model,
-            lr=args.inner_lr,
+            lr=0.05,  # Default inner learning rate
             first_order=False,
             allow_unused=True,
             allow_nograd=True
@@ -216,26 +179,35 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
         for param in maml.parameters():
             param.requires_grad = True
         
-        optimizer = torch.optim.Adam(maml.parameters(), lr=args.outer_lr)
-        scaler = torch.cuda.amp.GradScaler()
+        optimizer = torch.optim.Adam(maml.parameters(), lr=0.001)  # Default outer learning rate
         
         print("\nStarting training...")
         best_val_acc = 0
         patience = 10
         patience_counter = 0
         
-        for epoch in range(args.epochs):
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
+        for epoch in range(100):  # Default to 100 epochs
+            print(f"\nEpoch {epoch+1}/100")
             
             try:
+                # Clear memory before each epoch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
                 train_loss, train_acc = train_epoch(
                     maml, train_loader, optimizer, device,
-                    args.adaptation_steps, scaler
+                    adaptation_steps=5  # Default adaptation steps
                 )
+                
+                # Clear memory after training
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
                 
                 val_loss, val_acc = validate(
                     maml, val_loader, device,
-                    adaptation_steps=args.adaptation_steps
+                    adaptation_steps=5  # Default adaptation steps
                 )
                 
                 print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -259,13 +231,13 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
                     if patience_counter >= patience:
                         print(f'Early stopping triggered after {epoch + 1} epochs')
                         break
-            
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"WARNING: GPU OOM error in epoch {epoch+1}. Trying to recover...")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    continue
+                    print(f"CRITICAL: GPU OOM error in epoch {epoch+1}")
+                    print("This likely indicates the batch size is too large or the model is too memory intensive")
+                    print("Consider reducing batch size or model size")
+                    # Don't try to recover - exit with error so SLURM can handle it
+                    sys.exit(1)
                 else:
                     raise e
         
@@ -277,13 +249,13 @@ def main(seed=None, output_dir=None, pb_data_dir='data/meta_h5/pb'):
         test_results = {}
         for task in train_tasks:
             print(f"\nTesting on task: {task}")
-            test_dataset = SameDifferentDataset(args.data_dir, [task], 'test', support_sizes=[args.support_size])
-            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
-                                   num_workers=4, pin_memory=True, collate_fn=collate_episodes)
+            test_dataset = SameDifferentDataset(args.data_dir, [task], 'test')
+            test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, 
+                                   num_workers=2, pin_memory=True, collate_fn=collate_episodes)
             
             test_loss, test_acc = validate(
                 maml, test_loader, device,
-                adaptation_steps=args.test_adaptation_steps
+                adaptation_steps=15  # Default test adaptation steps
             )
             
             test_results[task] = {

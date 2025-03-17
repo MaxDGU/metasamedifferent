@@ -13,10 +13,11 @@ import sys
 import learn2learn as l2l
 import torch.nn as nn
 
-from models.conv2lr import SameDifferentCNN as Conv2CNN
-from models.conv4lr import SameDifferentCNN as Conv4CNN
-from models.conv6lr import SameDifferentCNN as Conv6CNN
-from models.conv6lr import SameDifferentDataset, collate_episodes
+from conv2lr import SameDifferentCNN as Conv2CNN
+from conv4lr import SameDifferentCNN as Conv4CNN
+from conv6lr import SameDifferentCNN as Conv6CNN
+from conv6lr import SameDifferentDataset, collate_episodes
+from utils_meta import train_epoch, validate
 
 PB_TASKS = [
     'regular', 'lines', 'open', 'wider_line', 'scrambled',
@@ -41,150 +42,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train_epoch(model, train_loader, optimizer, device, adaptation_steps, scaler):
-    """Train for one epoch using mixed precision."""
-    model.train()
-    total_loss = 0
-    total_acc = 0
-    n_batches = 0
-    
-    pbar = tqdm(train_loader, desc='Training')
-    for batch_idx, episodes in enumerate(pbar):
-        optimizer.zero_grad()
-        batch_loss = 0
-        batch_acc = 0
-        
-        with torch.amp.autocast(device_type='cuda'):
-            for episode in episodes:
-                learner = model.clone()
-                
-                support_images = episode['support_images'].to(device, non_blocking=True)
-                support_labels = episode['support_labels'].unsqueeze(1).to(device, non_blocking=True)
-                query_images = episode['query_images'].to(device, non_blocking=True)
-                query_labels = episode['query_labels'].unsqueeze(1).to(device, non_blocking=True)
-                
-                # Get per-layer learning rates
-                layer_lrs = learner.module.get_layer_lrs()
-                
-                # Inner loop adaptation
-                for _ in range(adaptation_steps):
-                    support_preds = learner(support_images)
-                    support_loss = F.binary_cross_entropy_with_logits(
-                        support_preds[:, 1], support_labels.squeeze(1).float())
-                    
-                    # Calculate gradients
-                    grads = torch.autograd.grad(support_loss, learner.parameters(),
-                                              create_graph=True, allow_unused=True)
-                    
-                    # Apply per-layer learning rates
-                    for (name, param), grad in zip(learner.named_parameters(), grads):
-                        if grad is not None:
-                            lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
-                            param.data = param.data - lr.abs() * grad
-                
-                # Evaluate on query set
-                query_preds = learner(query_images)
-                query_loss = F.binary_cross_entropy_with_logits(
-                    query_preds[:, 1], query_labels.squeeze(1).float())
-                query_acc = accuracy(query_preds, query_labels)
-                
-                batch_loss += query_loss
-                batch_acc += query_acc
-        
-        batch_loss = batch_loss / len(episodes)
-        batch_acc = batch_acc / len(episodes)
-        
-        scaler.scale(batch_loss).backward()
-        
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=10.0)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        total_loss += batch_loss.item()
-        total_acc += batch_acc.item()
-        n_batches += 1
-        
-        pbar.set_postfix({
-            'loss': total_loss/n_batches,
-            'acc': total_acc/n_batches
-        })
-    
-    return total_loss/n_batches, total_acc/n_batches
-
-def validate(model, val_loader, device, adaptation_steps, inner_lr=None):
-    """Validate model using per-layer learning rates."""
-    model.eval()
-    total_val_loss = 0
-    total_val_acc = 0
-    num_batches = 0
-
-    for batch_idx, episodes in enumerate(val_loader):
-        batch_loss = 0
-        batch_acc = 0
-        
-        for episode in episodes:
-            support_images = episode['support_images'].to(device, non_blocking=True)
-            support_labels = episode['support_labels'].unsqueeze(1).to(device, non_blocking=True)
-            query_images = episode['query_images'].to(device, non_blocking=True)
-            query_labels = episode['query_labels'].unsqueeze(1).to(device, non_blocking=True)
-
-            # Clone model for adaptation
-            adapted_model = copy.deepcopy(model)
-            adapted_model.train()
-            
-            for param in adapted_model.parameters():
-                param.requires_grad_(True)
-            
-            # Get per-layer learning rates
-            layer_lrs = adapted_model.module.get_layer_lrs()
-
-            for step in range(adaptation_steps):
-                support_preds = adapted_model(support_images)
-                support_loss = F.binary_cross_entropy_with_logits(
-                    support_preds[:, 1],
-                    support_labels.squeeze(1).float()
-                )
-                
-                grads = torch.autograd.grad(
-                    support_loss,
-                    adapted_model.parameters(),
-                    create_graph=True,
-                    retain_graph=True
-                )
-                
-                # Apply per-layer learning rates
-                for (name, param), grad in zip(adapted_model.named_parameters(), grads):
-                    if grad is not None:
-                        lr = layer_lrs.get(name, torch.tensor(0.01).to(device))
-                        param.data = param.data - lr.abs() * grad
-
-            adapted_model.eval()
-            with torch.no_grad():
-                query_preds = adapted_model(query_images)
-                query_loss = F.binary_cross_entropy_with_logits(
-                    query_preds[:, 1],
-                    query_labels.squeeze(1).float()
-                )
-                
-                query_acc = accuracy(query_preds, query_labels)
-                
-                batch_loss += query_loss.item()
-                batch_acc += query_acc.item()
-        
-        avg_batch_loss = batch_loss / len(episodes)
-        avg_batch_acc = batch_acc / len(episodes)
-        
-        total_val_loss += avg_batch_loss
-        total_val_acc += avg_batch_acc
-        num_batches += 1
-
-    avg_val_loss = total_val_loss / num_batches
-    avg_val_acc = total_val_acc / num_batches
-
-    return avg_val_loss, avg_val_acc
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='data/pb/pb',
@@ -193,10 +50,10 @@ def main():
                         help='Directory to save results')
     parser.add_argument('--architecture', type=str, required=True,
                         choices=['conv2', 'conv4', 'conv6'],
-                        help='Architecture to train')
+                        help='Model architecture to use')
     parser.add_argument('--seed', type=int, required=True,
                         help='Random seed for reproducibility')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training and testing')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
@@ -206,8 +63,14 @@ def main():
                         help='Number of adaptation steps during training')
     parser.add_argument('--test_adaptation_steps', type=int, default=15,
                         help='Number of adaptation steps during testing')
+    parser.add_argument('--inner_lr', type=float, default=0.05,
+                        help='Inner loop learning rate')
     parser.add_argument('--outer_lr', type=float, default=0.001,
                         help='Outer loop learning rate')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Patience for early stopping')
+    parser.add_argument('--min_delta', type=float, default=0.001,
+                        help='Minimum improvement for early stopping')
     args = parser.parse_args()
     
     try:
@@ -217,6 +80,12 @@ def main():
             device = torch.device('cpu')
         else:
             device = torch.device('cuda')
+            # Set CUDA memory management settings
+            torch.cuda.empty_cache()
+            torch.backends.cudnn.benchmark = False  # More memory efficient
+            torch.backends.cudnn.deterministic = True
+            # Set CUDA memory allocation to be more conservative
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Use only 80% of available GPU memory
         
         if not os.path.exists(args.data_dir):
             raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
@@ -231,9 +100,11 @@ def main():
         val_dataset = SameDifferentDataset(args.data_dir, PB_TASKS, 'val', support_sizes=[args.support_size])
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
-                                num_workers=4, pin_memory=True, collate_fn=collate_episodes)
+                                num_workers=1, pin_memory=True,
+                                collate_fn=collate_episodes)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
-                              num_workers=4, pin_memory=True, collate_fn=collate_episodes)
+                              num_workers=1, pin_memory=True,
+                              collate_fn=collate_episodes)
         
         print(f"\nCreating {args.architecture} model")
         model = ARCHITECTURES[args.architecture]().to(device)
@@ -251,7 +122,7 @@ def main():
         
         maml = l2l.algorithms.MAML(
             model, 
-            lr=0.05,  # Set a default learning rate
+            lr=args.inner_lr,
             first_order=False,
             allow_unused=True,
             allow_nograd=True
@@ -265,7 +136,6 @@ def main():
         
         print("\nStarting training...")
         best_val_acc = 0
-        patience = 10
         patience_counter = 0
         
         for epoch in range(args.epochs):
@@ -277,6 +147,10 @@ def main():
                     args.adaptation_steps, scaler
                 )
                 
+                # Clear memory before validation
+                torch.cuda.empty_cache()
+                gc.collect()
+                
                 val_loss, val_acc = validate(
                     maml, val_loader, device,
                     args.adaptation_steps
@@ -287,7 +161,8 @@ def main():
                 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                    torch.save({
+                    # Save checkpoint
+                    checkpoint = {
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'maml_state_dict': maml.state_dict(),
@@ -296,13 +171,19 @@ def main():
                         'train_acc': train_acc,
                         'val_loss': val_loss,
                         'val_acc': val_acc,
-                    }, os.path.join(arch_dir, 'best_model.pt'))
+                    }
+                    torch.save(checkpoint, os.path.join(arch_dir, 'best_model.pt'))
+                    del checkpoint  # Free memory
                     patience_counter = 0
                 else:
                     patience_counter += 1
-                    if patience_counter >= patience:
+                    if patience_counter >= args.patience:
                         print(f'Early stopping triggered after {epoch + 1} epochs')
                         break
+                
+                # Clear memory after each epoch
+                torch.cuda.empty_cache()
+                gc.collect()
             
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -323,7 +204,12 @@ def main():
             print(f"\nTesting on task: {task}")
             test_dataset = SameDifferentDataset(args.data_dir, [task], 'test', support_sizes=[args.support_size])
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
-                                   num_workers=4, pin_memory=True, collate_fn=collate_episodes)
+                                   num_workers=1, pin_memory=True,
+                                   collate_fn=collate_episodes)
+            
+            # Clear memory before testing each task
+            torch.cuda.empty_cache()
+            gc.collect()
             
             test_loss, test_acc = validate(
                 maml, test_loader, device, 
@@ -353,6 +239,10 @@ def main():
     
     except Exception as e:
         print(f"\nERROR: Training failed with error: {str(e)}")
+        print(f"Error type: {type(e)}")
+        print(f"Error details: {str(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == '__main__':
